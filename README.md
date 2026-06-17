@@ -1,7 +1,7 @@
 # latent_pipeline
 
 Nbody→Mgas conditional flow matching (FM) + Mgas→(Ω_m, σ8) normalizing flow (NF),
-multi-suite CAMELS 128³. See `CLAUDE.md` for full details.
+multi-suite CAMELS 128³. 
 
 ## Structure
 
