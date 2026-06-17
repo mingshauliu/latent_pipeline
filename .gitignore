@@ -16,3 +16,4 @@ outputs/
 *.png
 *.npy
 *.npz
+CLAUDE.md
