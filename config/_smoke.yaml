@@ -1,0 +1,137 @@
+data:
+  box_size: 25
+  cache_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm
+  crop_size: 64
+  mgas_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
+  n_cosmo: 2
+  nbody_path_tmpl: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_{suite}_LH_128_z=0.0.npy
+  norm3d_path: /mnt/home/mliu1/ceph/norm3d.npy
+  param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+  resolution: 128
+  stats_n_sample: 96
+  suites:
+  - IllustrisTNG
+  - Astrid
+  - SIMBA
+  use_cache: true
+  val_split: 0.2
+inference:
+  checkpoint: null
+  latent_mode: mean
+  method: euler
+  n_stochastic: 1
+  num_steps: 50
+  offload_skips: false
+  output_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth
+  sources:
+  - mgas_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/Grids_Mgas_IllustrisTNG_LH_256_z=0.0.npy
+    n_samples: null
+    name: IllustrisTNG_LH256
+    nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_IllustrisTNG_LH_256_z=0.0.npy
+    param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/params_LH_IllustrisTNG.txt
+  - mgas_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/Grids_Mgas_Astrid_LH_256_z=0.0.npy
+    n_samples: null
+    name: Astrid_LH256
+    nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_Astrid_LH_256_z=0.0.npy
+    param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/params_LH_Astrid.txt
+  - mgas_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/Grids_Mgas_SIMBA_LH_256_z=0.0.npy
+    n_samples: null
+    name: SIMBA_LH256
+    nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_SIMBA_LH_256_z=0.0.npy
+    param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/params_LH_SIMBA.txt
+model:
+  base_channels: 32
+  circular_padding: true
+  cosmo_dim: 2
+  encoder_base: 8
+  encoder_dropout: 0.1
+  in_channels: 2
+  latent_dim: 8
+  norm_type: pixel
+  out_channels: 1
+nf:
+  data:
+    mgas_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_256_z=0.0.npy
+    mode: real
+    n_cosmo: 2
+    param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+    stats_n_sample: 96
+    suites:
+    - IllustrisTNG
+    - Astrid
+    - SIMBA
+    synth_dir_tmpl: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth/{suite}_LH256
+    val_split: 0.2
+  inference:
+    batch_size: 2
+    checkpoint: null
+    dpi: 150
+    n_posterior_samples: 2000
+    output_dir: outputs/nf_inference
+    param_names:
+    - $\Omega_m$
+    - $\sigma_8$
+  model:
+    base_channels: 4
+    circular_padding: true
+    dropout: 0.15
+    flow_bins: 8
+    flow_hidden: 128
+    flow_transforms: 4
+    flow_type: nsf
+    num_params: 2
+    summary_dim: 16
+  training:
+    accumulate_grad_batches: 8
+    aux_loss_decay: 1.0
+    aux_loss_weight: 0.5
+    batch_size: 2
+    checkpoint_dir: nf_checkpoints
+    devices: 4
+    early_stop_patience: 80
+    flow_warmup_epochs: 50
+    gradient_clip_val: 0.5
+    input_noise_std: 0.0
+    log_every_n_steps: 10
+    lr_encoder: 0.0003
+    lr_flow: 0.0001
+    max_epochs: 1500
+    num_workers: 4
+    plot_every_n_epochs: 5
+    precision: bf16-mixed
+    resume_from: null
+    seed: 42
+    skip_nan_loss: true
+    strategy: ddp
+    wandb_project: latent-pipeline-nf
+    warmup_epochs: 20
+    weight_decay: 0.0001
+training:
+  accumulate_grad: 4
+  batch_size: 1
+  devices: 1
+  ema:
+    decay: 0.9999
+    enabled: true
+    warmup_steps: 5000
+  gradient_checkpointing: false
+  gradient_clip: 1.0
+  log_every_n_steps: 50
+  lr: 0.0006
+  max_epochs: 1
+  noise_std: 0.1
+  num_workers: 0
+  precision: 32-true
+  prefetch_factor: 2
+  resume_from: null
+  save_top_k: 3
+  scheduler: cosine
+  seed: 42
+  skip_nan_loss: true
+  strategy: auto
+  wandb_project: latent-pipeline
+  warmup_epochs: 15
+  weight_decay: 0.001
+  xcorr_every_n_epochs: 0
+  xcorr_method: euler
+  xcorr_num_steps: 50

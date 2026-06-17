@@ -1,0 +1,196 @@
+# ============================================================
+# latent_pipeline — multi-suite Nbody -> Mgas FM + NF param inference
+# ============================================================
+# FM: conditional flow matching Nbody(Mtot) -> Mgas, conditioned on (Omega_m,
+# sigma_8) + an 8-dim latent encoded from Mgas. Trained over 3 CAMELS hydro
+# suites (IllustrisTNG, Astrid, SIMBA) LH at 128^3, z=0.
+
+# ---- data (shared by FM + NF) ----
+data:
+  suites: [IllustrisTNG, Astrid, SIMBA]
+  # {suite} is substituted per suite. Nbody is the DM-only total-matter grid.
+  nbody_path_tmpl: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_{suite}_LH_128_z=0.0.npy
+  mgas_path_tmpl:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
+  param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+  # Pre-normalised Mgas + cosmo cache (prep_cache.py); Nbody read raw + normed lazily
+  # with norm3d 'nbody'. use_cache=false -> lazy log1p+z-score of all fields.
+  use_cache: true
+  cache_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm
+  norm3d_path: /mnt/home/mliu1/ceph/norm3d.npy
+  n_cosmo: 2               # use first 2 cols (Omega_m, sigma_8) — universal across suites
+  resolution: 128
+  crop_size: null
+  clamp_val: 10           # clamp pre-normed cubes to +/-10 (cache mode). Caps the
+                          # Nbody overdensity heavy tail (max ~+21 = 45 sigma at DM
+                          # halo cores) that drove the epoch-73 loss spike to 7.89e3
+                          # and blew up the converged FM. Mgas range ~+/-9 untouched.
+  box_size: 25            # Mpc/h (CAMELS LH boxes)
+  val_split: 0.2
+  stats_n_sample: 96      # (lazy mode only) cubes sampled to estimate log1p+z-score stats
+
+# ---- FM model ----
+model:
+  in_channels: 2          # [x_t, nbody]
+  base_channels: 128
+  out_channels: 1
+  cosmo_dim: 2
+  latent_dim: 8           # Mgas -> 8-dim latent (GasEncoder)
+  encoder_base: 16        # GasEncoder SE-ResNet base channels
+  encoder_dropout: 0.1
+  circular_padding: true
+  norm_type: pixel        # resolution-invariant
+
+# ---- FM training ----
+training:
+  max_epochs: 2000
+  batch_size: 2
+  noise_std: 0.1
+  lr: 6.0e-4               # 2026-06-16: 3e-4 -> 6e-4. data.py log1p+z-scores both
+                          # fields (zero-mean/unit-var) -> FM target mean~0, init
+                          # loss ~2 (not ~16 as in upscaling's non-zero-mean data).
+                          # upscaling's slow brakes no longer needed.
+  weight_decay: 1.0e-3
+  gradient_checkpointing: false
+  gradient_clip: 1.0      # 2026-06-16: 0.5 -> 1.0 (no blow-up regime)
+  scheduler: cosine
+  warmup_epochs: 15       # 2026-06-16: 30 -> 15 (no blow-up regime)
+  accumulate_grad: 4
+  precision: "bf16-mixed"
+  devices: 4
+  strategy: ddp
+  num_workers: 4
+  prefetch_factor: 2
+  save_top_k: 3
+  log_every_n_steps: 50
+  xcorr_every_n_epochs: 5
+  xcorr_num_steps: 50
+  xcorr_method: euler
+  skip_nan_loss: true
+  loss_spike_thresh: 5.0   # skip finite-but-huge batches (normal loss 0.02-0.7).
+                           # Belt-and-suspenders with data.clamp_val against the
+                           # heavy-tail Nbody outlier that caused the epoch-73 blow-up.
+  seed: 42
+  # Resume from the pre-blowup best (val 0.0194 @ epoch 59). lr still ~6e-4 there
+  # (cosine barely decayed) so the model stays hot enough to leave the basin.
+  resume_from: latent-pipeline/d72nm6ol/checkpoints/best-epoch=059-val_loss=0.019434.ckpt
+  wandb_project: latent-pipeline
+  ema:
+    enabled: true
+    decay: 0.9999
+    warmup_steps: 5000
+
+# ---- FM inference ----
+inference:
+  checkpoint: null
+  num_steps: 50
+  method: dopri5           # 2026-06-16: 128^3 paradigm — synth gen matches NF res.
+                           # dopri5 fits at 128^3 (the 256^3 euler/offload workaround
+                           # no longer needed). Set num_steps for the fixed-step path.
+  offload_skips: false
+  latent_mode: mean        # mean | sample | encode
+  n_stochastic: 1
+  output_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth
+  # Generate FM-synth Mgas at 128^3 (train res = gen res) from the LH 128 Nbody,
+  # per suite, to feed the synth-NF training. Output -> <output_dir>/<name>/sample_*.npy.
+  # `name` must match nf.data.synth_dir_tmpl ({suite}_LH128).
+  sources:
+    - name: IllustrisTNG_LH128
+      nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_IllustrisTNG_LH_128_z=0.0.npy
+      mgas_path:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/Grids_Mgas_IllustrisTNG_LH_128_z=0.0.npy
+      param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/params_LH_IllustrisTNG.txt
+      n_samples: null
+    - name: Astrid_LH128
+      nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_Astrid_LH_128_z=0.0.npy
+      mgas_path:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/Grids_Mgas_Astrid_LH_128_z=0.0.npy
+      param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/params_LH_Astrid.txt
+      n_samples: null
+    - name: SIMBA_LH128
+      nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_SIMBA_LH_128_z=0.0.npy
+      mgas_path:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/Grids_Mgas_SIMBA_LH_128_z=0.0.npy
+      param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/params_LH_SIMBA.txt
+      n_samples: null
+
+# ============================================================
+# NF branch — multi-suite Mgas(128^3) -> (Omega_m, sigma_8)
+# ============================================================
+# TWO trainings off one config, switched by --data_mode (or nf.data.mode):
+#   real  : NF on real CAMELS LH 128^3 Mgas        (mgas_path_tmpl)
+#   synth : NF on FM-synth 128^3 Mgas sample dirs  (synth_dir_tmpl)
+# NF encodes 128^3 (ResNet3D is resolution-agnostic via AdaptiveAvgPool3d).
+nf:
+  data:
+    mode: real             # real | synth  (override per run: --data_mode synth)
+    suites: [IllustrisTNG, Astrid, SIMBA]
+    n_cosmo: 2
+    # 2026-06-16: 128^3 paradigm — NF trains on the SAME 128^3 multi-suite Mgas
+    # pool as FM (was LH_256). Normalised with the SHARED norm3d 'gas' stats (see
+    # data.nf_mgas_stats), matching the FM cache + Magneticum held-out cache.
+    norm3d_path:     /mnt/home/mliu1/ceph/norm3d.npy
+    mgas_path_tmpl:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
+    param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+    synth_dir_tmpl:  /mnt/ceph/users/mliu1/latent_pipeline_cache/synth/{suite}_LH128
+    val_split: 0.2
+
+  model:
+    base_channels: 4         # tiny encoder (ctx 8*4=32); avoids memorization
+    num_params: 2            # Omega_m, sigma_8
+    flow_hidden: 128
+    flow_transforms: 4
+    flow_type: nsf
+    flow_bins: 8
+    dropout: 0.15
+    summary_dim: 6           # 2026-06-16: 16 -> 6 (upscaling 128^3 value). INFO
+                             # BOTTLENECK: 8*base=32-d summary projected to 6-d
+                             # before aux+flow. Cosmo signal ~3 scalars; 6 floats
+                             # can't memorize per-cube fingerprints across 2400
+                             # train cubes -> kills encoder->flow memorization.
+    circular_padding: true
+
+  training:
+    lr_encoder: 3.0e-4
+    lr_flow: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_epochs: 20
+    flow_warmup_epochs: 50
+    early_stop_patience: 80
+    max_epochs: 1500
+    batch_size: 8            # 2026-06-16: 2 -> 8 (128^3 paradigm). base_channels=4
+                            # -> tiny acts, full 128^3 box fits at batch 8 (grad
+                            # ckpt on in encoder). Matches upscaling 128^3.
+    num_workers: 4
+    accumulate_grad_batches: 2   # 2026-06-16: 8 -> 2. eff batch 8*2*4 = 64 unchanged
+                                 # -> epoch-based schedule (flow_warmup 50, early
+                                 # stop 80) intact.
+    precision: "bf16-mixed"
+    devices: 4
+    strategy: ddp
+    gradient_clip_val: 0.5
+    log_every_n_steps: 10
+    aux_loss_weight: 0.5
+    aux_loss_decay: 1.0
+    input_noise_std: 0.0
+    skip_nan_loss: true
+    checkpoint_dir: nf_checkpoints
+    resume_from: null
+    wandb_project: latent-pipeline-nf
+    seed: 42
+    plot_every_n_epochs: 5
+
+  inference:
+    checkpoint: null
+    n_posterior_samples: 2000
+    batch_size: 2
+    dpi: 150
+    output_dir: outputs/nf_inference
+    param_names: ["$\\Omega_m$", "$\\sigma_8$"]
+    # data mode (real|synth) comes from nf.data.mode or --data_mode.
+
+  # ---- OOD held-out test (nf/ood.py) ----
+  # Magneticum = 4th feedback model, NOT in the train pool (TNG/Astrid/SIMBA).
+  # Raw Mgas + physical params; nf/ood.py applies the shared norm3d 'gas' z-score
+  # (data.nf_mgas_stats), identical to NF training input. real-NF here = BASELINE.
+  heldout:
+    name: Magneticum
+    mgas_path:  /mnt/ceph/users/mliu1/CAMELS-L25n256/Grids_Mgas_Magneticum_LH_128_z=0.0.npy
+    param_path: /mnt/ceph/users/mliu1/CAMELS-L25n256/params_LH_Magneticum.txt
+    n_cosmo: 2

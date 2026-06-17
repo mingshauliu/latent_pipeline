@@ -1,0 +1,9 @@
+wandb/
+logs/
+.claude/
+__pycache__/
+.ipynb_checkpoints/
+checkpoints/
+nf_ck_real/
+latent-pipeline/
+cached/
