@@ -1,0 +1,101 @@
+# ============================================================
+# NF OOD TEST — train on IllustrisTNG ONLY, test on Magneticum (OOD)
+# ============================================================
+# Self-contained config for the single-suite OOD generalisation test. Differs
+# from config/config.yaml ONLY in:
+#   nf.data.suites           [IllustrisTNG, Astrid, SIMBA] -> [IllustrisTNG]
+#   nf.training.checkpoint_dir   nf_checkpoints -> nf_ood_test/ckpt
+#   nf.training.wandb_project    -> latent-pipeline-nf-ood
+# Everything else (model, heldout=Magneticum, inference, norm) is unchanged so
+# the NF input pipeline + held-out normalisation match the main pipeline exactly.
+#
+# Run (from latent_pipeline/):
+#   ./submit.sh nf_train nf_ood_test/config_tng.yaml --run_name ood_tng_only
+#   # after it finishes, pick best ckpt + plot OOD:
+#   bash nf_ood_test/eval.sh        # auto-picks best ckpt, runs nf.ood -> plot
+#
+# Only nf.train and nf.ood read this file (both use cfg["nf"] only); the FM
+# data/model/training/inference blocks below are carried for completeness.
+
+# ---- data (FM; unused by the NF OOD test, carried for completeness) ----
+data:
+  suites: [IllustrisTNG, Astrid, SIMBA]
+  nbody_path_tmpl: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_{suite}_LH_128_z=0.0.npy
+  mgas_path_tmpl:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
+  param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+  use_cache: true
+  cache_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm
+  norm3d_path: /mnt/home/mliu1/ceph/norm3d.npy
+  n_cosmo: 2
+  resolution: 128
+  crop_size: null
+  clamp_val: 10
+  box_size: 25
+  val_split: 0.2
+  stats_n_sample: 96
+
+# ============================================================
+# NF branch — IllustrisTNG-only Mgas(128^3) -> (Omega_m, sigma_8)
+# ============================================================
+nf:
+  data:
+    mode: real
+    suites: [IllustrisTNG]          # <-- OOD TEST: single training suite
+    n_cosmo: 2
+    norm3d_path:     /mnt/home/mliu1/ceph/norm3d.npy
+    mgas_path_tmpl:  /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
+    param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
+    synth_dir_tmpl:  /mnt/ceph/users/mliu1/latent_pipeline_cache/synth/{suite}_LH128
+    val_split: 0.2
+
+  model:
+    base_channels: 4
+    num_params: 2
+    flow_hidden: 128
+    flow_transforms: 4
+    flow_type: nsf
+    flow_bins: 8
+    dropout: 0.15
+    summary_dim: 6
+    circular_padding: true
+
+  training:
+    lr_encoder: 3.0e-4
+    lr_flow: 1.0e-4
+    weight_decay: 1.0e-4
+    warmup_epochs: 20
+    flow_warmup_epochs: 50
+    early_stop_patience: 80
+    max_epochs: 1500
+    batch_size: 8
+    num_workers: 4
+    accumulate_grad_batches: 2
+    precision: "bf16-mixed"
+    devices: 4
+    strategy: ddp
+    gradient_clip_val: 0.5
+    log_every_n_steps: 10
+    aux_loss_weight: 0.5
+    aux_loss_decay: 1.0
+    input_noise_std: 0.0
+    skip_nan_loss: true
+    checkpoint_dir: nf_ood_test/ckpt   # <-- isolated from main nf_checkpoints
+    resume_from: null
+    wandb_project: latent-pipeline-nf-ood
+    seed: 42
+    plot_every_n_epochs: 5
+
+  inference:
+    checkpoint: null
+    n_posterior_samples: 2000
+    batch_size: 2
+    dpi: 150
+    output_dir: nf_ood_test/outputs
+    param_names: ["$\\Omega_m$", "$\\sigma_8$"]
+
+  # ---- OOD held-out test (nf/ood.py) — Magneticum (4th feedback model) ----
+  heldout:
+    name: Magneticum
+    mgas_path:  /mnt/ceph/users/mliu1/CAMELS-L25n256/Grids_Mgas_Magneticum_LH_128_z=0.0.npy
+    param_path: /mnt/ceph/users/mliu1/CAMELS-L25n256/params_LH_Magneticum.txt
+    n_cosmo: 2
