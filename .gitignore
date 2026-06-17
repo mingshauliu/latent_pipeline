@@ -5,5 +5,14 @@ __pycache__/
 .ipynb_checkpoints/
 checkpoints/
 nf_ck_real/
+nf_ck_synth/
 latent-pipeline/
 cached/
+outputs/
+# generated artifacts / weights
+*.ckpt
+*.pt
+*.pth
+*.png
+*.npy
+*.npz

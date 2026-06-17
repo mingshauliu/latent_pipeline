@@ -105,8 +105,10 @@ def main():
     np.savez(out_root / f"predictions_{stem}.npz",
              y_true=y_true, y_mean=y_mean, y_std=y_std, aux_pred=aux,
              rmse=rmse, r2=r2, param_names=np.array(names))
+    nf_label = {"real": "real-NF", "synth": "synth-NF"}.get(args.tag, f"{args.tag}-NF")
+    title = f"{name} held-out OOD test — {nf_label} baseline (N={len(flat)})"
     plot_truth_vs_pred(y_true, y_mean, y_std, out_root / f"{stem}.png",
-                       names, dpi=ic.get("dpi", 150))
+                       names, dpi=ic.get("dpi", 150), title=title)
     print(f"\nOOD ({name}, NF={args.tag}, N={len(flat)}):")
     for nm, rm, rr in zip(names, rmse, r2):
         print(f"  {nm}: RMSE={rm:.4f}  R2={rr:.3f}")

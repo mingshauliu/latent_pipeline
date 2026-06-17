@@ -24,7 +24,8 @@ from .module import LitNFRegressor, MultiSuiteMgasDataset
 from .predict import predict_with_uncertainty
 
 
-def plot_truth_vs_pred(y_true, y_pred, y_std, out_path, param_names=None, dpi=150):
+def plot_truth_vs_pred(y_true, y_pred, y_std, out_path, param_names=None, dpi=150,
+                       title=None):
     n = y_true.shape[1]
     fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 3.4), squeeze=False)
     axes = axes.reshape(-1)
@@ -39,6 +40,9 @@ def plot_truth_vs_pred(y_true, y_pred, y_std, out_path, param_names=None, dpi=15
         ax.plot([lo - m, hi + m], [lo - m, hi + m], "r--", lw=1)
         ax.set_title(f"{param_names[j] if param_names else f'p{j}'}  RMSE={rmse:.3f} R²={r2:.2f}", fontsize=9)
         ax.grid(alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=11)
     plt.tight_layout()
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -81,8 +85,9 @@ def main():
     tag = nf_data.get("mode", "real")
     np.savez(out_root / f"predictions_{tag}.npz",
              y_true=y_true, y_mean=y_mean, y_std=y_std, aux_pred=aux)
+    title = f"NF whole-pool ({tag}, multi-suite N={len(flat)})"
     plot_truth_vs_pred(y_true, y_mean, y_std, out_root / f"truth_vs_pred_{tag}.png",
-                       ic.get("param_names"), dpi=ic.get("dpi", 150))
+                       ic.get("param_names"), dpi=ic.get("dpi", 150), title=title)
 
 
 if __name__ == "__main__":
