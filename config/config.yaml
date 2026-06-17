@@ -17,6 +17,8 @@ data:
   use_cache: true
   cache_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm
   norm3d_path: /mnt/home/mliu1/ceph/norm3d.npy
+  # Nbody Astrid (128/25)^3 unit correction is baked into the cache (prep_cache.py),
+  # so the dataset reads Nbody_norm directly.
   n_cosmo: 2               # use first 2 cols (Omega_m, sigma_8) — universal across suites
   resolution: 128
   crop_size: null

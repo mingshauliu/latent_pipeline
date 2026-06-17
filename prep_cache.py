@@ -1,23 +1,22 @@
-"""Pre-normalise the L25 (LH 128^3) Mgas (baryon) cubes for IllustrisTNG, Astrid,
+"""Pre-normalise the L25 (LH 128^3) Nbody + Mgas cubes for IllustrisTNG, Astrid,
 SIMBA and write them to a systematic ceph cache.
 
-Only the BARYON field (Mgas) is cached — the Nbody (DM-only) field is left alone
-in its source dir (/mnt/home/camels/ceph/.../Nbody/), shared across suites.
-
 Normalization (per /mnt/home/mliu1/ceph/norm3d.npy, log1p):
-    Mgas_norm = (log1p(Mgas) - norm['gas']['mean']) / norm['gas']['std']
+    Mgas_norm  = (log1p(Mgas) - norm['gas']['mean']) / norm['gas']['std']
+    Nbody_norm = (log1p(Mtot / suite_div) - norm['nbody']['mean']) / norm['nbody']['std']
+                 where suite_div = (128/25)^3 for Astrid (missing volume factor), 1 else
+    cosmo      = (params[:, :2] - norm['param']['mean'][:2]) / norm['param']['std'][:2]
 
 Streamed cube-by-cube via np.lib.format.open_memmap (low RAM). Output layout:
 
     <OUT>/
-      Mgas_norm_IllustrisTNG_LH_128_z=0.0.npy   (1000,128,128,128) f32
-      Mgas_norm_Astrid_LH_128_z=0.0.npy         (1000,128,128,128) f32
-      Mgas_norm_SIMBA_LH_128_z=0.0.npy          (1000,128,128,128) f32
-      cosmo_{suite}.npy                          (1000,2)  Omega_m, sigma_8
-      norm_meta.npz                              gas stats + provenance
+      Nbody_norm_{suite}_LH_128_z=0.0.npy   (1000,128,128,128) f32
+      Mgas_norm_{suite}_LH_128_z=0.0.npy    (1000,128,128,128) f32
+      cosmo_{suite}.npy                      (1000,2)  Omega_m, sigma_8
+      norm_meta.npz                          stats + provenance
 
-    python prep_cache.py
-    python prep_cache.py --suites SIMBA
+    python prep_cache.py                 # Nbody + Mgas + cosmo
+    python prep_cache.py --no_mgas       # Nbody only (keep existing Mgas/cosmo)
 """
 
 import argparse
@@ -38,51 +37,37 @@ def normalise_mgas(raw, mean, std):
     return ((np.log1p(raw.astype(np.float32)) - np.float32(mean)) / np.float32(std)).astype(np.float32)
 
 
-def overdensity_log1p(raw):
-    """Nbody Mtot -> log1p(rho / rho_bar_cube). Per-cube mean division makes the
-    transform UNIT-FREE and suite-invariant (Astrid Nbody is ~192x off-scale vs
-    TNG/SIMBA purely from particle-mass units; overdensity removes it). See CLAUDE.md."""
+# Astrid's Mtot grid is missing the (N/L)^3 = (128/25)^3 volume factor -> raw values
+# ~134.22x too large (confirmed: mean/Omega_m is 134.22x TNG/SIMBA, 0% scatter).
+# Divide it back to TNG/SIMBA units, THEN apply the shared log1p + norm3d 'nbody'.
+NBODY_SUITE_DIV = {"Astrid": (128.0 / 25.0) ** 3}   # = 134.217728; others default 1.0
+
+
+def normalise_nbody(raw, div, mean, std):
+    """Astrid (128/25)^3 unit correction -> log1p -> shared norm3d nbody z-score."""
     c = raw.astype(np.float32)
-    m = np.float32(c.mean()) + np.float32(1e-8)
-    return np.log1p(c / m).astype(np.float32)
-
-
-def normalise_nbody(raw, mean, std):
-    """overdensity log1p then global z-score. float32 out."""
-    return ((overdensity_log1p(raw) - np.float32(mean)) / np.float32(std)).astype(np.float32)
-
-
-def estimate_nbody_od_stats(suites, n_per_suite=48, seed=0):
-    """Global (mean,std) of log1p(1+delta) over a subset across suites. Pooled std."""
-    rng = np.random.RandomState(seed)
-    ms, vs = [], []
-    for suite in suites:
-        a = np.load(NBODY_TMPL.format(suite=suite), mmap_mode="r")
-        pick = rng.choice(len(a), size=min(n_per_suite, len(a)), replace=False)
-        for i in pick:
-            d = overdensity_log1p(np.asarray(a[i]))
-            ms.append(float(d.mean())); vs.append(float(d.var()))
-    mean = float(np.mean(ms))
-    std = float(np.sqrt(np.mean(vs) + np.var(ms)) + 1e-8)
-    return mean, std
+    if div != 1.0:
+        c = c / np.float32(div)
+    return ((np.log1p(c) - np.float32(mean)) / np.float32(std)).astype(np.float32)
 
 
 def process_suite_nbody(suite, nb_m, nb_s, out_dir, log_every=100):
     nb_in = np.load(NBODY_TMPL.format(suite=suite), mmap_mode="r")
     n = len(nb_in)
+    div = float(NBODY_SUITE_DIV.get(suite, 1.0))
     out_path = os.path.join(out_dir, f"Nbody_norm_{suite}_LH_128_z=0.0.npy")
     nb_out = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(n, GRID, GRID, GRID))
-    print(f"\n[{suite}] {n} Nbody cubes (overdensity) -> {os.path.basename(out_path)}")
+    print(f"\n[{suite}] {n} Nbody cubes (raw/{div:g} -> log1p+norm3d) -> {os.path.basename(out_path)}")
     s = q = 0.0
     for i in range(n):
-        nbn = normalise_nbody(np.asarray(nb_in[i]), nb_m, nb_s)
+        nbn = normalise_nbody(np.asarray(nb_in[i]), div, nb_m, nb_s)
         nb_out[i] = nbn
         s += float(nbn.mean()); q += float((nbn ** 2).mean())
         if (i + 1) % log_every == 0:
             print(f"  {suite} nbody {i+1}/{n}", flush=True)
     nb_out.flush(); del nb_out
     mean, std = s / n, (q / n - (s / n) ** 2) ** 0.5
-    print(f"  [{suite}] Nbody_norm pool mean~{mean:+.3f} std~{std:.3f} | wrote {out_path}")
+    print(f"  [{suite}] Nbody_norm pool mean~{mean:+.3f} std~{std:.3f} (div {div:g}) | wrote {out_path}")
     return n
 
 
@@ -129,11 +114,11 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # Nbody overdensity stats (computed once over the pool; suite-invariant)
+    # Nbody: shared norm3d 'nbody' stats (Astrid unit-corrected by (128/25)^3 first)
     nb_m = nb_s = None
     if not args.no_nbody:
-        nb_m, nb_s = estimate_nbody_od_stats(args.suites)
-        print(f"Nbody overdensity log1p(1+delta) global mean/std = {nb_m:.4f}/{nb_s:.4f}")
+        nb_m, nb_s = float(norm["nbody"]["mean"]), float(norm["nbody"]["std"])
+        print(f"norm3d nbody mean/std = {nb_m:.4f}/{nb_s:.4f} | Astrid div = {NBODY_SUITE_DIV['Astrid']:.6f}")
 
     counts = {}
     for s in args.suites:
@@ -146,8 +131,9 @@ def main():
         mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
         cosmo_mean=cos_m, cosmo_std=cos_s,
         source=np.array(NORM3D),
-        transform=np.array("Mgas: log1p+zscore(norm3d gas); Nbody: overdensity log1p(1+delta)+global zscore; cosmo: zscore(param[:2])"),
-        field=np.array("Mgas + Nbody(overdensity) both cached"),
+        transform=np.array("Mgas: log1p+zscore(norm3d gas); Nbody: Astrid/(128/25)^3 then log1p+zscore(norm3d nbody); cosmo: zscore(param[:2])"),
+        field=np.array("Mgas + Nbody(scalar-corrected norm3d) both cached"),
+        astrid_nbody_div=np.float32(NBODY_SUITE_DIV["Astrid"]),
         suites=np.array(args.suites), counts=np.array([counts[s] for s in args.suites]))
     if nb_m is not None:
         meta["nbody_mean"] = np.float32(nb_m)
@@ -163,8 +149,8 @@ def main():
                  nbody_mean=np.float32(nb_m), nbody_std=np.float32(nb_s),
                  mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
                  cosmo_mean=cos_m, cosmo_std=cos_s,
-                 nbody_transform=np.array("overdensity"))
-        print(f"Wrote {local} (nbody overdensity stats for infer)")
+                 nbody_transform=np.array("scalar-corrected-norm3d"))
+        print(f"Wrote {local} (nbody scalar-corrected norm3d stats for infer)")
     print(f"\nDone. cache -> {args.out}")
 
 
