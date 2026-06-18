@@ -67,6 +67,12 @@ def main():
                    help="label for outputs (which NF training produced the ckpt)")
     p.add_argument("--output_dir", default=None)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--heldout_name", default=None,
+                   help="override held-out feedback model name (e.g. Swift-EAGLE)")
+    p.add_argument("--heldout_mgas", default=None,
+                   help="override raw stacked held-out Mgas .npy (training units)")
+    p.add_argument("--heldout_param", default=None,
+                   help="override held-out cosmo param .txt (cols[:n_cosmo]=Om,s8)")
     args = p.parse_args()
 
     with open(args.config) as f:
@@ -74,7 +80,10 @@ def main():
     nf_cfg = cfg["nf"]
     nf_data = nf_cfg["data"]
     ic = nf_cfg.get("inference", {})
-    ho = nf_cfg.get("heldout", DEFAULT_HELDOUT)
+    ho = dict(nf_cfg.get("heldout", DEFAULT_HELDOUT))
+    if args.heldout_name:  ho["name"] = args.heldout_name
+    if args.heldout_mgas:  ho["mgas_path"] = args.heldout_mgas
+    if args.heldout_param: ho["param_path"] = args.heldout_param
 
     dev = args.device if torch.cuda.is_available() else "cpu"
     print(f"Loading {args.checkpoint}  (tag={args.tag})  device={dev}")
