@@ -2,9 +2,13 @@
 
 Latent modes (Mgas is unknown at sampling, so the conditioning latent must be
 supplied):
-  mean   : latent = 0  (marginal over feedback realisations) [default]
-  sample : latent ~ N(0, I) drawn per cube (stochastic feedback realisation)
-  encode : latent encoded from a reference true-Mgas cube (oracle / sanity check)
+  mean    : latent = 0  (marginal over feedback realisations) [default]
+  sample  : latent ~ N(0, I) drawn per cube (mismatched: encoder output is tanh)
+  encode  : latent encoded from a reference true-Mgas cube (oracle / sanity check)
+  gaussian: latent ~ N(mu, Sigma) fit to the encoded TRAINING set
+            (cached/latent_stats.npz from extract_latents.py); drawn per cube,
+            clamped to [-1, 1] to respect the tanh support. The realistic-coverage
+            mode for generating synth from TNG LH Nbody/cosmo.
 
     python infer.py --config config/config.yaml
 """
@@ -65,6 +69,22 @@ def main():
     mode = ic.get("latent_mode", "mean")
     n_stoch = ic.get("n_stochastic", 1)
 
+    gauss = None
+    if mode == "gaussian":
+        stats_path = ic.get("latent_stats", "cached/latent_stats.npz")
+        z = np.load(stats_path)
+        gmu = z["mean"].astype(np.float64)
+        gcov = z["cov"].astype(np.float64)
+        # eigen-decomposition sampler: robust to the (degenerate) low-rank cov —
+        # L = mu + V·sqrt(max(lam,0))·randn keeps draws on the SAME latent manifold
+        # as training (degenerate directions stay collapsed; no PSD warnings).
+        lam, V = np.linalg.eigh(gcov)
+        A = V @ np.diag(np.sqrt(np.clip(lam, 0.0, None)))
+        gauss = (gmu, A)
+        rank = int((lam > 1e-8 * lam.max()).sum())
+        print(f"gaussian latent envelope from {stats_path} (dim={len(gmu)}, "
+              f"rank={rank}/{len(gmu)} [degenerate], |mu|max={np.abs(gmu).max():.3f})")
+
     for src in ic.get("sources", []):
         name = src["name"]
         nbody = np.load(src["nbody_path"], mmap_mode="r")
@@ -91,6 +111,11 @@ def main():
                     latent = torch.zeros(1, latent_dim, device=dev)
                 elif mode == "sample":
                     latent = torch.randn(1, latent_dim, device=dev)
+                elif mode == "gaussian":
+                    gmu, A = gauss
+                    l = gmu + A @ np.random.randn(len(gmu))
+                    l = np.clip(l, -1.0, 1.0).astype(np.float32)
+                    latent = torch.from_numpy(l)[None].to(dev)
                 elif mode == "encode":
                     mg = norm_field(np.asarray(mgas_ref[i], dtype=np.float32),
                                     norm["mgas_mean"], norm["mgas_std"])

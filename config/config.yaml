@@ -89,8 +89,14 @@ inference:
                            # dopri5 fits at 128^3 (the 256^3 euler/offload workaround
                            # no longer needed). Set num_steps for the fixed-step path.
   offload_skips: false
-  latent_mode: mean        # mean | sample | encode
-  n_stochastic: 1
+  latent_mode: mean        # mean | sample | encode | gaussian
+  n_stochastic: 1          # latent draws per cube (gaussian/sample): coverage knob
+  latent_stats: cached/latent_stats.npz   # gaussian mode: N(mu,Sigma) from extract_latents.py
+  # GAUSSIAN-SYNTH usage (realistic feedback coverage from TNG LH Nbody/cosmo):
+  #   1) python extract_latents.py --checkpoint <fm.ckpt>   -> cached/latent_stats.npz
+  #   2) set latent_mode: gaussian (+ n_stochastic for >1 latent/cube), then run infer
+  #      with a TNG source whose `name` differs (e.g. IllustrisTNG_LH128_gauss) so the
+  #      gaussian synth lands in its own <output_dir>/<name>/ dir.
   output_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth
   # Generate FM-synth Mgas at 128^3 (train res = gen res) from the LH 128 Nbody,
   # per suite, to feed the synth-NF training. Output -> <output_dir>/<name>/sample_*.npy.

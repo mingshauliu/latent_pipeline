@@ -8,12 +8,12 @@
 #SBATCH -J LATENT
 #SBATCH -p gpu
 #SBATCH -N 1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --constraint=a100-80gb
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=480G
-#SBATCH -t 3-00:00
+#SBATCH -t 0-02:00
 #SBATCH -o logs/%x_%j.out
 #SBATCH -e logs/%x_%j.err
 
