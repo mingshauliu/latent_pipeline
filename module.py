@@ -87,6 +87,14 @@ class FlowMatchingModel(pl.LightningModule):
         self.box_size = d["box_size"] * (crop / res) if crop and crop < res else d["box_size"]
         self.latent_dim = m.get("latent_dim", 8)
 
+        # Variational (beta-VAE) latent: GasEncoder -> (mu, logvar), z reparametrised,
+        # KL(q||N(0,I)) added to the recon loss. beta warms up linearly; per-dim
+        # free-bits floor keeps individual dims from fully collapsing.
+        self.variational = bool(m.get("variational", False))
+        self.kl_beta = float(t.get("kl_beta", 1.0e-3))
+        self.kl_warmup_epochs = int(t.get("kl_warmup_epochs", 0))
+        self.kl_free_bits = float(t.get("kl_free_bits", 0.0))
+
         self.net = ClassicUNet(
             in_channels=m["in_channels"],
             base_channels=m["base_channels"],
@@ -101,6 +109,7 @@ class FlowMatchingModel(pl.LightningModule):
             base=m.get("encoder_base", 16),
             dropout=m.get("encoder_dropout", 0.1),
             circular_padding=m["circular_padding"],
+            variational=self.variational,
         )
         if t.get("gradient_checkpointing", False):
             self.net.enable_gradient_checkpointing()
@@ -123,29 +132,64 @@ class FlowMatchingModel(pl.LightningModule):
     def forward(self, x, t, cosmo, latent):
         return self.net(x, t, cosmo, latent)
 
-    def _step(self, batch, augment=False):
+    def _encode_latent(self, mgas, sample_latent):
+        """Returns (latent, kl). Deterministic -> (tanh latent, None).
+        Variational -> reparametrised z (mu if not sample_latent) + scalar KL."""
+        enc = self.gas_encoder(mgas)
+        if not self.variational:
+            return enc, None
+        mu, logvar = enc
+        if sample_latent:
+            latent = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        else:
+            latent = mu
+        return latent, self._kl(mu, logvar)
+
+    def _kl(self, mu, logvar):
+        # per-dim KL(q||N(0,I)) averaged over the batch, free-bits floor per dim,
+        # then summed over dims.
+        kld = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+        kld = kld.mean(0)                                      # (D,)
+        if self.kl_free_bits > 0:
+            kld = torch.clamp(kld, min=self.kl_free_bits)
+        return kld.sum()
+
+    def _beta(self):
+        if self.kl_warmup_epochs <= 0:
+            return self.kl_beta
+        return self.kl_beta * min(1.0, self.current_epoch / self.kl_warmup_epochs)
+
+    def _step(self, batch, augment=False, sample_latent=False):
         nbody, mgas, cosmo = batch
         if augment:
             nbody, mgas = self.aug(nbody, mgas)
         B = nbody.size(0)
-        latent = self.gas_encoder(mgas)
+        latent, kl = self._encode_latent(mgas, sample_latent)
         t = torch.rand(B, device=nbody.device)
         x0 = (nbody + torch.randn_like(nbody) * self.noise_std) if self.noise_std > 0 else nbody
         x1 = mgas
         t_exp = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_exp) * x0 + t_exp * x1
         pred = self(torch.cat([x_t, nbody], 1), t, cosmo, latent)
-        return F.mse_loss(pred, x1 - x0)
+        return F.mse_loss(pred, x1 - x0), kl
 
     def training_step(self, batch, _):
-        loss = self._step(batch, augment=True)
-        if self.skip_nan_loss and not torch.isfinite(loss):
+        # sample the latent (reparam) so the KL is meaningful; guard on the RECON
+        # term (KL is small, recon stays in the 0.02-0.7 regime the threshold targets).
+        recon, kl = self._step(batch, augment=True, sample_latent=True)
+        if self.skip_nan_loss and not torch.isfinite(recon):
             self.log("nan_skip", 1.0, on_step=True, on_epoch=False)
             return None
-        if self.spike_thresh is not None and loss.detach() > self.spike_thresh:
+        if self.spike_thresh is not None and recon.detach() > self.spike_thresh:
             self.log("spike_skip", 1.0, on_step=True, on_epoch=False)
             return None
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        loss = recon
+        if self.variational:
+            beta = self._beta()
+            loss = recon + beta * kl
+            self.log("kl", kl, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("kl_beta", beta, on_step=False, on_epoch=True)
+        self.log("train_loss", recon, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -153,7 +197,11 @@ class FlowMatchingModel(pl.LightningModule):
             self._ema_update()
 
     def validation_step(self, batch, batch_idx):
-        loss = self._step(batch)
+        # val recon uses the mean latent (no sampling) -> val_loss is comparable to
+        # the deterministic baseline and across all sweep variants.
+        loss, kl = self._step(batch, sample_latent=False)
+        if self.variational and kl is not None:
+            self.log("val_kl", kl, prog_bar=False, on_step=False, on_epoch=True)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log("lr", self.optimizers().param_groups[0]["lr"], on_epoch=True, prog_bar=True)
         is_xcorr_epoch = (not self.trainer.sanity_checking
@@ -255,7 +303,8 @@ class FlowMatchingModel(pl.LightningModule):
         nbody, mgas, cosmo = batch
         nb32, cosmo32 = nbody.float(), cosmo.float()
         B, dev = nb32.size(0), nb32.device
-        latent = self.gas_encoder(mgas.float())
+        # oracle latent = encode the TRUE Mgas; variational uses the mean (mu).
+        latent, _ = self._encode_latent(mgas.float(), sample_latent=False)
         x0 = nb32 + torch.randn_like(nb32) * self.noise_std if self.noise_std > 0 else nb32.clone()
         buf = torch.empty(B, 2, *nb32.shape[2:], device=dev, dtype=torch.float32)
         buf[:, 1:2] = nb32
@@ -303,9 +352,16 @@ class FlowMatchingModel(pl.LightningModule):
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        t = dict(self.hparams["training"])
+        eta_min = float(t.get("eta_min", 1e-6))
+
         if self.scheduler == "cosine":
+            # T_max defaults to the full run (current behaviour: lr barely anneals
+            # over 2000 epochs). Set cosine_t_max << max_epochs for an AGGRESSIVE
+            # anneal that actually drives lr -> eta_min to break the high-lr plateau.
+            t_max = int(t.get("cosine_t_max", self.max_epochs - self.warmup_epochs))
             cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=self.max_epochs - self.warmup_epochs, eta_min=1e-6)
+                opt, T_max=t_max, eta_min=eta_min)
             if self.warmup_epochs > 0:
                 warmup = torch.optim.lr_scheduler.LinearLR(
                     opt, start_factor=0.01, total_iters=self.warmup_epochs)
@@ -314,5 +370,26 @@ class FlowMatchingModel(pl.LightningModule):
             else:
                 sched = cosine
             return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.95, patience=10)
+
+        if self.scheduler == "cosine_restarts":
+            # SGDR: periodic re-heat to escape the basin, then anneal each cycle.
+            sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                opt, T_0=int(t.get("restart_t0", 50)),
+                T_mult=int(t.get("restart_tmult", 2)), eta_min=eta_min)
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
+
+        if self.scheduler == "onecycle":
+            # Aggressive: ramp to max_lr then anneal hard to ~lr/div_final.
+            total = int(self.trainer.estimated_stepping_batches)
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, max_lr=float(t.get("onecycle_max_lr", self.lr)),
+                total_steps=total, pct_start=float(t.get("onecycle_pct_start", 0.1)),
+                div_factor=float(t.get("onecycle_div_factor", 25.0)),
+                final_div_factor=float(t.get("onecycle_final_div", 1e4)))
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+        # plateau (adaptive): drop lr when val_loss stalls.
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, factor=float(t.get("plateau_factor", 0.5)),
+            patience=int(t.get("plateau_patience", 15)), min_lr=eta_min)
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"}}

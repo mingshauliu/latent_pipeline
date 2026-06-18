@@ -269,14 +269,22 @@ class _EncBlock(nn.Module):
 
 class GasEncoder(nn.Module):
     """Mgas (B,1,D,D,D) -> latent (B, latent_dim). 3 strided SE-ResNet stages,
-    global avg pool, LayerNorm, project to latent_dim, tanh-bounded."""
+    global avg pool, LayerNorm, project to latent_dim.
+
+    Two heads:
+      - deterministic (default): project -> latent_dim, tanh-bounded to [-1, 1].
+      - variational: project -> 2*latent_dim = (mu, logvar), NO tanh. forward
+        returns (mu, logvar); the caller reparametrises z = mu + eps*exp(.5*logvar)
+        and regularises with KL(q || N(0,I)). Makes infer latent_mode=sample
+        (N(0,I)) valid by construction (prior == latent dist)."""
 
     def __init__(self, latent_dim=8, base=16, dropout=0.1,
-                 circular_padding=True, use_checkpoint=True):
+                 circular_padding=True, use_checkpoint=True, variational=False):
         super().__init__()
         pad = "circular" if circular_padding else "constant"
         self.pad_mode = pad
         self.use_checkpoint = use_checkpoint
+        self.variational = variational
         self.stem = nn.Conv3d(1, base, 3, bias=False)
         self.enc1 = _EncBlock(base, 2*base, dropout, pad)
         self.enc2 = _EncBlock(2*base, 4*base, dropout, pad)
@@ -284,7 +292,7 @@ class GasEncoder(nn.Module):
         self.se = SEBlock3D(8*base)
         self.pool = nn.AdaptiveAvgPool3d(1)
         self.norm = nn.LayerNorm(8*base)
-        self.proj = nn.Linear(8*base, latent_dim)
+        self.proj = nn.Linear(8*base, latent_dim * 2 if variational else latent_dim)
 
     def _ckpt(self, module, x):
         if self.use_checkpoint and self.training:
@@ -299,4 +307,8 @@ class GasEncoder(nn.Module):
         x = self.se(x)
         x = self.pool(x).flatten(1)
         x = self.norm(x)
-        return torch.tanh(self.proj(x))
+        o = self.proj(x)
+        if self.variational:
+            mu, logvar = o.chunk(2, dim=-1)
+            return mu, logvar
+        return torch.tanh(o)

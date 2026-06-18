@@ -36,7 +36,10 @@ model:
   base_channels: 128
   out_channels: 1
   cosmo_dim: 2
-  latent_dim: 8           # Mgas -> 8-dim latent (GasEncoder)
+  latent_dim: 8           # Mgas -> latent_dim latent (GasEncoder)
+  variational: false      # true -> beta-VAE encoder: proj outputs (mu, logvar),
+                          # no tanh, z reparametrised + KL(q||N(0,I)) (see training.kl_*).
+                          # false -> deterministic tanh latent (default / baseline).
   encoder_base: 16        # GasEncoder SE-ResNet base channels
   encoder_dropout: 0.1
   circular_padding: true
@@ -71,6 +74,13 @@ training:
   loss_spike_thresh: 5.0   # skip finite-but-huge batches (normal loss 0.02-0.7).
                            # Belt-and-suspenders with data.clamp_val against the
                            # heavy-tail Nbody outlier that caused the epoch-73 blow-up.
+  # ---- variational (KL) latent — only used when model.variational: true ----
+  kl_beta: 1.0e-3          # KL weight (target after warmup); total = recon + beta*KL
+  kl_warmup_epochs: 30     # linear beta warmup 0 -> kl_beta over this many epochs
+  kl_free_bits: 0.5        # per-dim KL floor (nats); stops full posterior collapse
+  # ---- warm-start (training.init_from) ----
+  init_strict: true        # false -> partial load when latent head / cond_fuse change
+                           # shape (latent_dim / variational differ from init_from ckpt)
   seed: 42
   # Resume from the pre-blowup best (val 0.0194 @ epoch 59). lr still ~6e-4 there
   # (cosine barely decayed) so the model stays hot enough to leave the basin.

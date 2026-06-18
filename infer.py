@@ -3,12 +3,16 @@
 Latent modes (Mgas is unknown at sampling, so the conditioning latent must be
 supplied):
   mean    : latent = 0  (marginal over feedback realisations) [default]
-  sample  : latent ~ N(0, I) drawn per cube (mismatched: encoder output is tanh)
-  encode  : latent encoded from a reference true-Mgas cube (oracle / sanity check)
+  sample  : latent ~ N(0, I) drawn per cube. For a VARIATIONAL (KL) checkpoint
+            (model.variational=true) this is the CORRECT realistic mode — the KL
+            prior is N(0,I) so the latent distribution matches by construction.
+            For a deterministic (tanh) checkpoint it is mismatched (use gaussian).
+  encode  : latent encoded from a reference true-Mgas cube (oracle / sanity check;
+            variational -> uses the posterior mean mu).
   gaussian: latent ~ N(mu, Sigma) fit to the encoded TRAINING set
             (cached/latent_stats.npz from extract_latents.py); drawn per cube,
             clamped to [-1, 1] to respect the tanh support. The realistic-coverage
-            mode for generating synth from TNG LH Nbody/cosmo.
+            mode for a DETERMINISTIC (tanh) checkpoint; variational uses sample.
 
     python infer.py --config config/config.yaml
 """
@@ -120,7 +124,9 @@ def main():
                     mg = norm_field(np.asarray(mgas_ref[i], dtype=np.float32),
                                     norm["mgas_mean"], norm["mgas_std"])
                     with torch.no_grad():
-                        latent = model.gas_encoder(torch.from_numpy(mg)[None, None].to(dev))
+                        enc = model.gas_encoder(torch.from_numpy(mg)[None, None].to(dev))
+                    # variational encoder returns (mu, logvar) -> use the mean mu.
+                    latent = enc[0] if isinstance(enc, tuple) else enc
                 else:
                     raise ValueError(f"unknown latent_mode {mode}")
 

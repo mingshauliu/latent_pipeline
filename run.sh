@@ -47,8 +47,12 @@ case "$MODE" in
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     python -m nf.ood --config "$CONFIG" "${@:3}"
     ;;
+  extract)
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    python extract_latents.py --config "$CONFIG" "${@:3}"
+    ;;
   *)
-    echo "Unknown mode: $MODE (train | infer | nf_train | nf_infer | nf_ood)"
+    echo "Unknown mode: $MODE (train | infer | nf_train | nf_infer | nf_ood | extract)"
     exit 1
     ;;
 esac

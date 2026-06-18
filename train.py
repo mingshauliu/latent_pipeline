@@ -42,6 +42,48 @@ def build_norm(d, nbody_arrs, mgas_arrs, cosmo_all, flat):
     return norm
 
 
+@torch.no_grad()
+def warm_load_partial(model, src_sd):
+    """Load a source state_dict into a model whose latent head / FiLM-fusion layers
+    changed shape (latent_dim and/or variational mu,logvar head differ). Copies all
+    shape-matching tensors, then smart-inits the two reshaped layers from source
+    slices: gas_encoder.proj <- source rows into the new mu rows; net.cond_fuse.0 <-
+    source time(64)+cosmo(64) input columns (latent columns stay freshly initialised).
+    EMA shadow is intentionally NOT loaded — it rebuilds from current weights."""
+    own = model.state_dict()
+    copied, skipped = [], []
+    for k, v in src_sd.items():
+        if k in own and own[k].shape == v.shape:
+            own[k].copy_(v)
+            copied.append(k)
+        else:
+            skipped.append((k, tuple(v.shape), tuple(own[k].shape) if k in own else None))
+
+    pw = "gas_encoder.proj.weight"
+    if pw in src_sd and pw in own:
+        s, dnew = src_sd[pw], own[pw]
+        # cap at latent_dim so only the mu head is warm-started; for a variational
+        # head the logvar rows [latent_dim:] stay freshly initialised (logvar~0).
+        r = min(s.shape[0], dnew.shape[0], model.latent_dim)
+        dnew[:r].copy_(s[:r])
+        own["gas_encoder.proj.bias"][:r].copy_(src_sd["gas_encoder.proj.bias"][:r])
+        print(f"  smart-init gas_encoder.proj: copied {r} (mu) rows from source")
+
+    cw = "net.cond_fuse.0.weight"
+    if cw in src_sd and cw in own:
+        s, dnew = src_sd[cw], own[cw]
+        c = min(128, s.shape[1], dnew.shape[1])   # time(64)+cosmo(64); latent cols fresh
+        dnew[:, :c].copy_(s[:, :c])
+        own["net.cond_fuse.0.bias"].copy_(src_sd["net.cond_fuse.0.bias"])
+        print(f"  smart-init net.cond_fuse.0: copied {c} time+cosmo cols from source")
+
+    model.load_state_dict(own, strict=True)
+    print(f"Partial warm-start: copied {len(copied)} matching tensors; "
+          f"{len(skipped)} reshaped (smart-init/fresh):")
+    for k, sshape, dshape in skipped:
+        print(f"  reshaped {k}: src{sshape} -> dst{dshape}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
@@ -96,6 +138,27 @@ def main():
                        num_workers=t["num_workers"], **kw)
 
     model = FlowMatchingModel(cfg)
+
+    # Weights-only warm start: load the converged EMA-baked weights but start a
+    # FRESH optimizer/scheduler at epoch 0 (unlike resume_from, which restores the
+    # old scheduler state + epoch). Use this to test a new/aggressive lr schedule
+    # against a plateaued checkpoint. EMA shadow is carried over so EMA keeps refining.
+    init_from = t.get("init_from")
+    if init_from and not t.get("resume_from"):
+        print(f"Warm-start (weights only) from: {init_from}")
+        ck = torch.load(init_from, map_location="cpu", weights_only=False)
+        if t.get("init_strict", True):
+            model.load_state_dict(ck["state_dict"], strict=True)  # EMA-baked weights
+            if model.ema_enabled and "ema_shadow" in ck:
+                model._ema_shadow = {n: tt for n, tt in ck["ema_shadow"].items()}
+        else:
+            # Partial warm-start: the latent head (gas_encoder.proj) and the FiLM
+            # context fusion (net.cond_fuse.0) change shape when latent_dim and/or
+            # the variational (mu,logvar) head differ from the source ckpt. Copy
+            # every shape-matching key (full UNet backbone + encoder SE-ResNet), then
+            # smart-init the two reshaped layers from their source slices. EMA shadow
+            # is NOT carried over (shapes changed) — it rebuilds from current weights.
+            warm_load_partial(model, ck["state_dict"])
 
     trainer = pl.Trainer(
         logger=WandbLogger(project=t.get("wandb_project", "latent-pipeline"), log_model=False),
