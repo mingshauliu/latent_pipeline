@@ -69,6 +69,10 @@ class FlowMatchingModel(pl.LightningModule):
         self.lr = t["lr"]
         self.wd = t["weight_decay"]
         self.noise_std = t["noise_std"]
+        # Time sampling for the FM interpolant. 'uniform' = t~U(0,1) (original).
+        # 'logitnormal' = t=sigmoid(N(0,1)) — concentrates t near 0.5 (SD3/EDM), where
+        # the velocity field is hardest; the encoder3D recipe that reaches xcorr ~0.9.
+        self.time_sampling = t.get("time_sampling", "uniform")
         self.scheduler = t.get("scheduler", "cosine")
         self.warmup_epochs = t.get("warmup_epochs", 0)
         self.max_epochs = t["max_epochs"]
@@ -165,7 +169,10 @@ class FlowMatchingModel(pl.LightningModule):
             nbody, mgas = self.aug(nbody, mgas)
         B = nbody.size(0)
         latent, kl = self._encode_latent(mgas, sample_latent)
-        t = torch.rand(B, device=nbody.device)
+        if self.time_sampling == "logitnormal":
+            t = torch.sigmoid(torch.randn(B, device=nbody.device))
+        else:
+            t = torch.rand(B, device=nbody.device)
         x0 = (nbody + torch.randn_like(nbody) * self.noise_std) if self.noise_std > 0 else nbody
         x1 = mgas
         t_exp = t.view(-1, 1, 1, 1, 1)

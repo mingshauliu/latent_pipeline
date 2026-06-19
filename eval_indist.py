@@ -46,12 +46,17 @@ def main():
     ap.add_argument("--latent_mode", default="encode", choices=["encode", "mean"])
     ap.add_argument("--num_steps", type=int, default=50)
     ap.add_argument("--method", default="dopri5")
+    ap.add_argument("--noise_std", type=float, default=None,
+                    help="override sampling noise to match the ckpt's training value "
+                         "(sv6mp9wt=0.1; config default is now 0.2 for new runs)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out_dir", default="outputs")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    if args.noise_std is not None:
+        cfg["training"]["noise_std"] = args.noise_std
     dev = args.device if torch.cuda.is_available() else "cpu"
     norm = load_norm()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -118,6 +123,9 @@ def main():
         ax[i, 0].imshow(nb_raw[i][z], cmap="viridis")
         ax[i, 1].imshow(t_s, cmap="Blues", vmin=vmin, vmax=vmax)
         ax[i, 2].imshow(s_s, cmap="Blues", vmin=vmin, vmax=vmax)
+        ax[i, 0].axis('off')
+        ax[i, 1].axis('off')
+        ax[i, 2].axis('off')
         d = ax[i, 3].imshow(s_s - t_s, cmap="coolwarm", vmin=-1, vmax=1)
         plt.colorbar(d, ax=ax[i, 3], fraction=0.046)
         ax[i, 0].set_ylabel(f"cube {i}")
@@ -133,16 +141,33 @@ def main():
     # ── (b) truth-vs-pred: voxel 2D hist + mean P(k) + ratio — all NORMED LOG ─────
     tv = np.concatenate([t.ravel() for t in true_raw])
     sv = np.concatenate([s.ravel() for s in synth_raw])
-    fig2, ax2 = plt.subplots(1, 3 if HAS_PKL else 1, figsize=(14 if HAS_PKL else 5, 4.2))
-    ax2 = np.atleast_1d(ax2)
+    
+    if HAS_PKL:
+        from matplotlib.gridspec import GridSpec
+        fig2 = plt.figure(figsize=(7, 9))
+        gs = GridSpec(3, 1, height_ratios=[3, 3, 1], hspace=0.15)
+        ax_hist = fig2.add_subplot(gs[0])
+        ax_pk = fig2.add_subplot(gs[1])
+        ax_ratio = fig2.add_subplot(gs[2], sharex=ax_pk)
+        ax2 = [ax_hist, ax_pk, ax_ratio]
+    else:
+        fig2, ax2 = plt.subplots(1, 1, figsize=(5, 4.2))
+        ax2 = np.atleast_1d(ax2)
+    
+    # ── (b1) 2D histogram ──────────────────────────────────────────────────────
     lo, hi = min(tv.min(), sv.min()), max(tv.max(), sv.max())
-    h = ax2[0].hist2d(tv, sv, bins=200, range=[[lo, hi], [lo, hi]], cmap="inferno",
-                      norm=matplotlib.colors.LogNorm())
-    ax2[0].plot([lo, hi], [lo, hi], "w--", lw=1)
-    plt.colorbar(h[3], ax=ax2[0], fraction=0.046)
-    ax2[0].set_xlabel("true (norm log Mgas)"); ax2[0].set_ylabel("synth (norm log Mgas)")
-    ax2[0].set_title(f"voxel truth-vs-pred ({N} cubes)")
+    fig_hist, ax_hist_only = plt.subplots(figsize=(5, 4.2))
+    h = ax_hist_only.hist2d(tv, sv, bins=200, range=[[lo, hi], [lo, hi]], cmap="inferno",
+                            norm=matplotlib.colors.LogNorm())
+    ax_hist_only.plot([lo, hi], [lo, hi], "w--", lw=1)
+    plt.colorbar(h[3], ax=ax_hist_only, fraction=0.046)
+    ax_hist_only.set_xlabel("true (norm log Mgas)"); ax_hist_only.set_ylabel("synth (norm log Mgas)")
+    ax_hist_only.set_title(f"voxel truth-vs-pred ({N} cubes)")
+    fig_hist.tight_layout()
+    p_hist = os.path.join(args.out_dir, f"indist_{suite}_hist.png")
+    fig_hist.savefig(p_hist, dpi=130); print(f"Saved {p_hist}")
 
+    # ── (b2) P(k) + ratio stacked ──────────────────────────────────────────────
     if HAS_PKL:
         ks, pts, pss, rats, xcs = None, [], [], [], []
         for i in range(N):
@@ -151,22 +176,31 @@ def main():
             ks = k; pts.append(pt); pss.append(ps); rats.append(ps / (pt + 1e-30))
             xcs.append(xcorr_metric(synth_raw[i], true_raw[i], box))
         pt_m, ps_m, r_m = np.mean(pts, 0), np.mean(pss, 0), np.mean(rats, 0)
-        ax2[1].loglog(ks, pt_m, "k-", label="true")
-        ax2[1].loglog(ks, ps_m, "r--", label="synth")
-        ax2[1].axvline(15, color="gray", ls=":", lw=1)
-        ax2[1].set_xlabel("k [h/Mpc]"); ax2[1].set_ylabel("P(k) of norm-log Mgas")
-        ax2[1].legend(); ax2[1].set_title("mean power spectrum (log space)")
-        ax2[2].semilogx(ks, r_m, "b-")
-        ax2[2].axhline(1, color="k", lw=0.8)
-        ax2[2].axhspan(0.9, 1.1, color="g", alpha=0.12)
-        ax2[2].axvline(15, color="gray", ls=":", lw=1)
-        ax2[2].set_ylim(0.5, 1.5); ax2[2].set_xlabel("k [h/Mpc]")
-        ax2[2].set_ylabel("P_synth / P_true"); ax2[2].set_title("P(k) ratio (±10% band)")
+        
+        fig2 = plt.figure(figsize=(7, 6.5))
+        gs = GridSpec(2, 1, height_ratios=[3, 1], hspace=0.1)
+        ax_pk = fig2.add_subplot(gs[0])
+        ax_ratio = fig2.add_subplot(gs[1], sharex=ax_pk)
+        
+        ax_pk.loglog(ks, pt_m, "C0-", label="true", color="tab:blue")
+        ax_pk.loglog(ks, ps_m, "C0--", label="synth", color="tab:blue")
+        ax_pk.axvline(15, color="gray", ls=":", lw=1)
+        ax_pk.set_xlim(ks.min(), 15)
+        ax_pk.set_ylabel("P(k) of norm-log Mgas")
+        ax_pk.legend(); ax_pk.set_title("mean power spectrum (log space)")
+        
+        ax_ratio.semilogx(ks, r_m, color="tab:blue", lw=2)
+        ax_ratio.axhline(1, color="k", lw=0.8)
+        ax_ratio.axhspan(0.9, 1.1, color="g", alpha=0.12)
+        ax_ratio.axvline(15, color="gray", ls=":", lw=1)
+        ax_ratio.set_xlim(ks.min(), 15)
+        ax_ratio.set_ylim(0.5, 1.5); ax_ratio.set_xlabel("k [h/Mpc]")
+        ax_ratio.set_ylabel("P_synth / P_true"); ax_ratio.set_title("P(k) ratio (±10% band)")
+        
         fig2.suptitle(f"{suite} det3 in-dist (norm log) — mean xcorr={np.mean(xcs):.4f}", fontsize=11)
-    fig2.tight_layout()
-    p2 = os.path.join(args.out_dir, f"indist_{suite}_tvp.png")
-    fig2.savefig(p2, dpi=130); print(f"Saved {p2}")
-    if HAS_PKL:
+        fig2.tight_layout()
+        p2 = os.path.join(args.out_dir, f"indist_{suite}_pk.png")
+        fig2.savefig(p2, dpi=130); print(f"Saved {p2}")
         print(f"\nmean xcorr={np.mean(xcs):.4f} | P(k) ratio @k<15 mean={np.mean(r_m[ks<=15]):.4f}")
 
 

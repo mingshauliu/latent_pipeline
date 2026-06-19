@@ -49,7 +49,10 @@ model:
 training:
   max_epochs: 2000
   batch_size: 2
-  noise_std: 0.1
+  noise_std: 0.2          # 2026-06-19: 0.1 -> 0.2 (user; matches encoder3D xcorr~0.9
+                          # recipe — more stochastic budget to paint small-scale Mgas).
+  time_sampling: logitnormal  # t=sigmoid(N(0,1)) — focus the hard t~0.5 (SD3/EDM),
+                          # the encoder3D recipe. 'uniform' = original t~U(0,1).
   lr: 6.0e-4               # 2026-06-16: 3e-4 -> 6e-4. data.py log1p+z-scores both
                           # fields (zero-mean/unit-var) -> FM target mean~0, init
                           # loss ~2 (not ~16 as in upscaling's non-zero-mean data).

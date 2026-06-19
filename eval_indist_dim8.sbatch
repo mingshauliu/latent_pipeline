@@ -29,4 +29,5 @@ python eval_indist.py \
     --config config/config.yaml \
     --checkpoint "$CKPT" \
     --suite IllustrisTNG --n 4 --latent_mode encode \
+    --noise_std 0.1 \
     --out_dir outputs/dim8
