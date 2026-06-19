@@ -60,7 +60,9 @@ def warm_load_partial(model, src_sd):
             skipped.append((k, tuple(v.shape), tuple(own[k].shape) if k in own else None))
 
     pw = "gas_encoder.proj.weight"
-    if pw in src_sd and pw in own:
+    if pw in src_sd and pw in own and src_sd[pw].shape[1] == own[pw].shape[1]:
+        # only when the encoder output width matches (encoder_base unchanged). If
+        # encoder_base differs the encoder is fresh anyway -> leave proj fresh too.
         s, dnew = src_sd[pw], own[pw]
         # cap at latent_dim so only the mu head is warm-started; for a variational
         # head the logvar rows [latent_dim:] stay freshly initialised (logvar~0).
@@ -68,6 +70,9 @@ def warm_load_partial(model, src_sd):
         dnew[:r].copy_(s[:r])
         own["gas_encoder.proj.bias"][:r].copy_(src_sd["gas_encoder.proj.bias"][:r])
         print(f"  smart-init gas_encoder.proj: copied {r} (mu) rows from source")
+    elif pw in src_sd and pw in own:
+        print(f"  gas_encoder.proj left fresh (encoder width "
+              f"{src_sd[pw].shape[1]}->{own[pw].shape[1]}; encoder_base changed)")
 
     cw = "net.cond_fuse.0.weight"
     if cw in src_sd and cw in own:

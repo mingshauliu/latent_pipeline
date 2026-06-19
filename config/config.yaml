@@ -82,9 +82,11 @@ training:
   init_strict: true        # false -> partial load when latent head / cond_fuse change
                            # shape (latent_dim / variational differ from init_from ckpt)
   seed: 42
-  # Resume from the pre-blowup best (val 0.0194 @ epoch 59). lr still ~6e-4 there
-  # (cosine barely decayed) so the model stays hot enough to leave the basin.
-  resume_from: latent-pipeline/d72nm6ol/checkpoints/best-epoch=059-val_loss=0.019434.ckpt
+  # CONTINUE sv6mp9wt (2026-06-19): it was still improving at ep276 (best ep269
+  # val 0.013353, not plateaued). resume_from restores optimiser+scheduler+epoch
+  # -> picks up the cosine toward ep2000. lr still ~5.7e-4 (T_max=1985 barely
+  # annealed), which is fine — high lr is still finding improvement here.
+  resume_from: latent-pipeline/sv6mp9wt/checkpoints/last.ckpt
   wandb_project: latent-pipeline
   ema:
     enabled: true

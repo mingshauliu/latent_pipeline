@@ -37,11 +37,22 @@ def norm_field(v, mean, std):
     return (np.log1p(v) - mean) / std
 
 
-def norm_nbody(v, mean, std):
-    """Overdensity log1p(rho/rho_bar_cube) + global z-score — MUST match prep_cache
-    (data is trained on the cached overdensity Nbody, suite-invariant)."""
-    v = v.astype(np.float32)
-    return (np.log1p(v / (v.mean() + 1e-8)) - mean) / std
+def norm_nbody(v, mean, std, div=1.0):
+    """Scalar-corrected norm3d — MUST match the prep_cache norm_meta transform:
+    'Astrid/(128/25)^3 then log1p+zscore(norm3d nbody)'. log1p of the MASS field
+    (NOT overdensity), z-scored by global norm3d nbody stats (mean ~18.4, std ~1.26).
+    div = (res/box)^3 for Astrid only (particle-mass/voxel-volume correction);
+    1.0 for IllustrisTNG/SIMBA."""
+    v = v.astype(np.float32) / div
+    return (np.log1p(v) - mean) / std
+
+
+def nbody_div(name, cfg):
+    """Astrid-only scalar correction (128/25)^3; 1.0 for the other suites."""
+    if "Astrid" in name:
+        d = cfg["data"]
+        return (d["resolution"] / d["box_size"]) ** 3
+    return 1.0
 
 
 def denorm_field(x, mean, std):
@@ -72,6 +83,9 @@ def main():
     offload = ic.get("offload_skips", False)
     mode = ic.get("latent_mode", "mean")
     n_stoch = ic.get("n_stochastic", 1)
+    # MUST match training (data.CachedFMDataset clamps both fields to +/-clamp_val
+    # before the net sees them). Sampling on un-clamped heavy-tail Nbody is OOD.
+    clamp_val = cfg["data"].get("clamp_val", 10.0)
 
     gauss = None
     if mode == "gaussian":
@@ -91,6 +105,7 @@ def main():
 
     for src in ic.get("sources", []):
         name = src["name"]
+        div = nbody_div(name, cfg)
         nbody = np.load(src["nbody_path"], mmap_mode="r")
         cosmo_all = np.loadtxt(src["param_path"]).astype(np.float32)[:, :cfg["data"].get("n_cosmo", 2)]
         mgas_ref = np.load(src["mgas_path"], mmap_mode="r") if (mode == "encode" and src.get("mgas_path")) else None
@@ -106,7 +121,9 @@ def main():
                 if os.path.exists(out_path):
                     continue
                 nb = norm_nbody(np.asarray(nbody[i], dtype=np.float32),
-                                norm["nbody_mean"], norm["nbody_std"])
+                                norm["nbody_mean"], norm["nbody_std"], div=div)
+                if clamp_val is not None:
+                    np.clip(nb, -clamp_val, clamp_val, out=nb)
                 nb_t = torch.from_numpy(nb)[None, None].to(dev)
                 cosmo = (cosmo_all[i] - norm["cosmo_mean"]) / norm["cosmo_std"]
                 cosmo_t = torch.from_numpy(cosmo.astype(np.float32))[None].to(dev)
@@ -123,6 +140,8 @@ def main():
                 elif mode == "encode":
                     mg = norm_field(np.asarray(mgas_ref[i], dtype=np.float32),
                                     norm["mgas_mean"], norm["mgas_std"])
+                    if clamp_val is not None:
+                        np.clip(mg, -clamp_val, clamp_val, out=mg)
                     with torch.no_grad():
                         enc = model.gas_encoder(torch.from_numpy(mg)[None, None].to(dev))
                     # variational encoder returns (mu, logvar) -> use the mean mu.

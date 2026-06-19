@@ -56,8 +56,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--out", default=OUT_NPZ)
+    ap.add_argument("--plot_out", default=None,
+                    help="corner PNG path; default = --out with _corner.png suffix")
     ap.add_argument("--no_plot", action="store_true")
     args = ap.parse_args()
+    png_out = args.plot_out or (os.path.splitext(args.out)[0] + "_corner.png")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -156,8 +159,8 @@ def main():
             fig.suptitle(f"FM encoder latents Z (N={len(Z)}, {len(suites)} suites) "
                          f"— red = fitted Gaussian 1$\\sigma$  | eff dim {eff_dim:.1f}/{d}")
             fig.tight_layout()
-            fig.savefig(OUT_PNG, dpi=120)
-            print(f"Saved {OUT_PNG}")
+            fig.savefig(png_out, dpi=120)
+            print(f"Saved {png_out}")
         except Exception as e:
             print(f"plot skipped: {e}")
 
