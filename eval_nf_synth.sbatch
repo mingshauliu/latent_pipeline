@@ -22,7 +22,7 @@ source /mnt/home/mliu1/env/bin/activate
 mkdir -p logs outputs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-FM=latent-pipeline/sv6mp9wt/checkpoints/best-epoch=269-val_loss=0.013353.ckpt
+FM=latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt
 NF=nf_ck_real/nf-752--5.4560.ckpt
 echo "Node: $(hostname) | FM: $FM | NF: $NF"
 nvidia-smi
@@ -35,5 +35,6 @@ for MODE in encode mean; do
       --nf_checkpoint "$NF" \
       --latent_mode "$MODE" \
       --noise_std 0.1 \
+      --out outputs/nf_synth_ep486_${MODE}_tvp.png \
       --max_cubes 300 --num_steps 50 --method dopri5
 done

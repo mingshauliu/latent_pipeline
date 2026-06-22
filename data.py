@@ -133,6 +133,54 @@ def nf_mgas_stats(nfd):
     return float(norm["gas"]["mean"]), float(norm["gas"]["std"])
 
 
+def compute_velocity_stats(nbody_arrs, mgas_arrs, flat, n_sample=64, seed=0,
+                           clamp_val=10.0):
+    """Pooled (mean,std) of the FM 'velocity' field v = Mgas_norm - Nbody_norm over a
+    random subset of cubes. Both fields are read from the PRE-NORMED FM cache (already
+    log1p+z-scored) and clamped to +/-clamp_val BEFORE differencing, matching exactly
+    what the FM sees (data.CachedFMDataset clamps both fields). NO log1p here -- v is a
+    difference of z-scored fields and is signed (can be negative), so log1p is invalid.
+    """
+    rng = np.random.RandomState(seed)
+    pick = rng.choice(len(flat), size=min(n_sample, len(flat)), replace=False)
+    means, vars_ = [], []
+    for k in pick:
+        si, li = flat[k]
+        nb = np.array(nbody_arrs[si][li], dtype=np.float32)
+        mg = np.array(mgas_arrs[si][li], dtype=np.float32)
+        if clamp_val is not None:
+            c = float(clamp_val)
+            np.clip(nb, -c, c, out=nb)
+            np.clip(mg, -c, c, out=mg)
+        v = mg - nb
+        means.append(float(v.mean()))
+        vars_.append(float(v.var()))
+    means = np.array(means); vars_ = np.array(vars_)
+    mean = float(means.mean())
+    std = float(np.sqrt(vars_.mean() + means.var()) + 1e-8)  # pooled std
+    return mean, std
+
+
+def velocity_stats(d, cache_path="cached/norm_velocity.npz", clamp_val=10.0):
+    """Load cached velocity (mean,std) from `cache_path`, else compute from the FM cache
+    pool (load_cache_pool) and write it. SINGLE source of truth shared by the standalone
+    velocity-NF training and the FM aux critic -- never recompute ad hoc."""
+    if os.path.exists(cache_path):
+        z = np.load(cache_path)
+        return float(z["vel_mean"]), float(z["vel_std"])
+    nbody_arrs, mgas_arrs, _, flat = load_cache_pool(d)
+    mean, std = compute_velocity_stats(nbody_arrs, mgas_arrs, flat, clamp_val=clamp_val)
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    # atomic write (tmp + rename) so concurrent DDP ranks can't truncate each other's
+    # file -- last rename wins, but every reader sees a complete npz.
+    tmp = f"{cache_path}.{os.getpid()}.tmp.npz"  # np.savez keeps a .npz suffix as-is
+    np.savez(tmp, vel_mean=np.float32(mean), vel_std=np.float32(std),
+             clamp_val=np.float32(clamp_val if clamp_val is not None else 0.0))
+    os.replace(tmp, cache_path)
+    print(f"  [velocity stats] mean {mean:.4f} std {std:.4f} -> {cache_path}")
+    return mean, std
+
+
 def compute_cosmo_stats(cosmo_all):
     mean = cosmo_all.mean(0).astype(np.float32)
     std = cosmo_all.std(0).astype(np.float32)

@@ -126,6 +126,58 @@ class FlowMatchingModel(pl.LightningModule):
         self._ema_shadow = None
         self._ema_backup = None
 
+        # ── velocity-NF cosmo-consistency aux loss (TRAINING-ONLY, opt-in) ──────
+        # A frozen NF p(cosmo | v=Mgas-Nbody) judges the FM-predicted velocity v_pred:
+        # aux = MSE(critic(v_pred), cosmo). Pressures the FM to keep cosmology readable
+        # in its output. Fully gated: velocity_nf_ckpt=None -> OFF (backward compatible).
+        # The critic is NEVER persisted in the FM ckpt and NEVER touched at sampling
+        # time, so a ckpt trained with aux loads + samples with aux off and no NF file.
+        self.vel_nf_ckpt = t.get("velocity_nf_ckpt")
+        self.vel_aux_weight = float(t.get("vel_aux_weight", 0.0))
+        self.vel_aux_warmup_epochs = int(t.get("vel_aux_warmup_epochs", 0))
+        self._vel_critic = None
+        if self.vel_nf_ckpt and self.vel_aux_weight > 0:
+            self._build_vel_critic(t.get("velocity_stats", "cached/norm_velocity.npz"))
+
+    # ── velocity-NF aux critic (frozen, training-only) ─────────────────────────
+    def _build_vel_critic(self, vel_stats_path):
+        """Load + freeze the velocity-NF critic and register the velocity-norm stats.
+        Critic is a regular submodule (so Lightning moves it to the right device) but
+        is stripped from the FM checkpoint in on_save_checkpoint, kept frozen + eval,
+        and excluded from EMA (_fm_named_params) + the optimizer (requires_grad filter)."""
+        from nf.module import LitNFRegressor
+        critic = LitNFRegressor.load_from_checkpoint(self.vel_nf_ckpt, map_location="cpu")
+        critic.eval()
+        for p in critic.parameters():
+            p.requires_grad_(False)
+        self._vel_critic = critic
+        z = np.load(vel_stats_path)
+        # non-persistent: not written to the FM ckpt (single source of truth = npz)
+        self.register_buffer("vel_mean", torch.tensor(float(z["vel_mean"])), persistent=False)
+        self.register_buffer("vel_std", torch.tensor(float(z["vel_std"])), persistent=False)
+        print(f"[FM aux] velocity-NF critic loaded: {self.vel_nf_ckpt} | "
+              f"vel norm {float(z['vel_mean']):.4f}/{float(z['vel_std']):.4f} | "
+              f"weight {self.vel_aux_weight} warmup {self.vel_aux_warmup_epochs}ep")
+
+    def _aux_on(self):
+        return self._vel_critic is not None and self.vel_aux_weight > 0
+
+    def _vel_aux_loss(self, v_pred, cosmo):
+        """MSE between the frozen critic's point cosmo estimate on v_pred and the true
+        cosmo (both in the critic's normalized param space). Critic stays frozen/eval;
+        gradient flows back through v_pred into the FM net only."""
+        self._vel_critic.eval()
+        v_in = (v_pred - self.vel_mean) / self.vel_std
+        _, aux_pred = self._vel_critic(v_in)
+        tm = self._vel_critic.flow.target_mean
+        ts = self._vel_critic.flow.target_std
+        return F.mse_loss((aux_pred - tm) / ts, (cosmo - tm) / ts)
+
+    def _vel_aux_w(self):
+        if self.vel_aux_warmup_epochs <= 0:
+            return self.vel_aux_weight
+        return self.vel_aux_weight * min(1.0, self.current_epoch / self.vel_aux_warmup_epochs)
+
     # latent + UNet params get EMA, keyed to match checkpoint state_dict.
     def _fm_named_params(self):
         for n, p in self.net.named_parameters():
@@ -178,12 +230,12 @@ class FlowMatchingModel(pl.LightningModule):
         t_exp = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_exp) * x0 + t_exp * x1
         pred = self(torch.cat([x_t, nbody], 1), t, cosmo, latent)
-        return F.mse_loss(pred, x1 - x0), kl
+        return F.mse_loss(pred, x1 - x0), kl, pred, cosmo
 
     def training_step(self, batch, _):
         # sample the latent (reparam) so the KL is meaningful; guard on the RECON
         # term (KL is small, recon stays in the 0.02-0.7 regime the threshold targets).
-        recon, kl = self._step(batch, augment=True, sample_latent=True)
+        recon, kl, pred, cosmo = self._step(batch, augment=True, sample_latent=True)
         if self.skip_nan_loss and not torch.isfinite(recon):
             self.log("nan_skip", 1.0, on_step=True, on_epoch=False)
             return None
@@ -196,6 +248,12 @@ class FlowMatchingModel(pl.LightningModule):
             loss = recon + beta * kl
             self.log("kl", kl, prog_bar=True, on_step=False, on_epoch=True)
             self.log("kl_beta", beta, on_step=False, on_epoch=True)
+        if self._aux_on():
+            aux = self._vel_aux_loss(pred, cosmo)
+            w = self._vel_aux_w()
+            loss = loss + w * aux
+            self.log("vel_aux", aux, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("vel_aux_w", w, on_step=False, on_epoch=True)
         self.log("train_loss", recon, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
@@ -206,7 +264,7 @@ class FlowMatchingModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         # val recon uses the mean latent (no sampling) -> val_loss is comparable to
         # the deterministic baseline and across all sweep variants.
-        loss, kl = self._step(batch, sample_latent=False)
+        loss, kl, _, _ = self._step(batch, sample_latent=False)
         if self.variational and kl is not None:
             self.log("val_kl", kl, prog_bar=False, on_step=False, on_epoch=True)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
@@ -263,6 +321,10 @@ class FlowMatchingModel(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         sd = checkpoint["state_dict"]
+        # Never persist the frozen velocity-NF critic -> a ckpt trained WITH aux loads
+        # + samples with aux OFF (velocity_nf_ckpt=None) and no NF file present.
+        for k in [k for k in sd if k.startswith("_vel_critic.")]:
+            del sd[k]
         if self.ema_enabled and self._ema_shadow is not None:
             checkpoint["live_state_dict"] = {
                 k: v.detach().cpu().clone()
@@ -358,7 +420,9 @@ class FlowMatchingModel(pl.LightningModule):
         return traj[-1]
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
+        # filter out the frozen velocity-NF critic params (requires_grad=False)
+        params = [p for p in self.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=self.lr, weight_decay=self.wd)
         t = dict(self.hparams["training"])
         eta_min = float(t.get("eta_min", 1e-6))
 

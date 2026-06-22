@@ -77,6 +77,14 @@ training:
   loss_spike_thresh: 5.0   # skip finite-but-huge batches (normal loss 0.02-0.7).
                            # Belt-and-suspenders with data.clamp_val against the
                            # heavy-tail Nbody outlier that caused the epoch-73 blow-up.
+  # ---- velocity-NF cosmo-consistency aux loss (TRAINING-ONLY, opt-in) ----
+  # Frozen NF p(cosmo | v=Mgas-Nbody) judges the FM-predicted v_pred:
+  # aux = MSE(critic(v_pred), cosmo). OFF by default (null) -> fully backward
+  # compatible; never persisted in the ckpt; never used at sampling.
+  velocity_nf_ckpt: null            # e.g. nf_ck_velocity/best.ckpt -> enables aux
+  vel_aux_weight: 0.0               # small, e.g. 0.05 when enabling
+  vel_aux_warmup_epochs: 5          # quick linear ramp 0 -> vel_aux_weight
+  velocity_stats: cached/norm_velocity.npz  # MUST match the velocity-NF training stats
   # ---- variational (KL) latent — only used when model.variational: true ----
   kl_beta: 1.0e-3          # KL weight (target after warmup); total = recon + beta*KL
   kl_warmup_epochs: 30     # linear beta warmup 0 -> kl_beta over this many epochs
@@ -142,7 +150,10 @@ inference:
 # NF encodes 128^3 (ResNet3D is resolution-agnostic via AdaptiveAvgPool3d).
 nf:
   data:
-    mode: real             # real | synth  (override per run: --data_mode synth)
+    mode: real             # real | synth | velocity  (override: --data_mode ...)
+    # velocity mode = NF on v = Mgas_norm - Nbody_norm (from cfg['data'] FM cache);
+    # vel stats cached here (data.velocity_stats), shared with the FM aux critic.
+    velocity_stats:  cached/norm_velocity.npz
     suites: [IllustrisTNG, Astrid, SIMBA]
     n_cosmo: 2
     # 2026-06-16: 128^3 paradigm — NF trains on the SAME 128^3 multi-suite Mgas

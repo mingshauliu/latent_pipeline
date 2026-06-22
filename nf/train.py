@@ -12,8 +12,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import WandbLogger
 import yaml
 
-from data import load_nf_pool, nf_mgas_stats
-from .module import LitNFRegressor, MultiSuiteNFDataModule
+from data import load_nf_pool, nf_mgas_stats, load_cache_pool, velocity_stats
+from .module import (LitNFRegressor, MultiSuiteNFDataModule,
+                     MultiSuiteVelocityDataModule)
 
 # 128^3 paradigm: NF reuses the SHARED norm3d 'gas' stats (see data.nf_mgas_stats)
 # so FM cache, Magneticum held-out cache, and NF input normalise identically.
@@ -35,8 +36,9 @@ class WarmupGatedEarlyStopping(EarlyStopping):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="config/config.yaml")
-    p.add_argument("--data_mode", choices=["real", "synth"], default=None,
-                   help="NF training data: real CAMELS 256 or FM-synth 256 (overrides config)")
+    p.add_argument("--data_mode", choices=["real", "synth", "velocity"], default=None,
+                   help="NF training data: real CAMELS Mgas, FM-synth Mgas, or "
+                        "velocity = Mgas_norm-Nbody_norm from the FM cache (overrides config)")
     p.add_argument("--checkpoint_dir", type=str, default=None)
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--summary_dim", type=int, default=None)
@@ -48,6 +50,8 @@ def main():
     p.add_argument("--lr_encoder", type=float, default=None)
     p.add_argument("--lr_flow", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
+    p.add_argument("--fast_dev_run", action="store_true",
+                   help="1 train+val batch, 1 device, no logging/ckpt (smoke)")
     args = p.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -69,16 +73,30 @@ def main():
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("medium")
 
-    print(f"NF data mode = {nf_data.get('mode', 'real')}")
-    mgas_src, cosmo_all, flat = load_nf_pool(nf_data)
-    mgas_mean, mgas_std = nf_mgas_stats(nf_data)
-    print(f"NF Mgas norm (shared norm3d gas): mean/std {mgas_mean:.4f}/{mgas_std:.4f}")
-
-    dm = MultiSuiteNFDataModule(
-        mgas_src, cosmo_all, flat, mgas_mean, mgas_std,
-        val_split=nf_cfg["data"].get("val_split", 0.2),
-        batch_size=nf_train["batch_size"], num_workers=nf_train.get("num_workers", 4),
-        seed=nf_train.get("seed", 42), input_noise_std=nf_train.get("input_noise_std", 0.0))
+    mode = nf_data.get("mode", "real")
+    print(f"NF data mode = {mode}")
+    if mode == "velocity":
+        # velocity-NF: v = Mgas_norm - Nbody_norm from the FM cache (cfg['data']).
+        clamp_val = cfg["data"].get("clamp_val", 10.0)
+        nbody_arrs, mgas_arrs, cosmo_all, flat = load_cache_pool(cfg["data"])
+        vel_mean, vel_std = velocity_stats(
+            cfg["data"], cache_path=nf_data.get("velocity_stats", "cached/norm_velocity.npz"),
+            clamp_val=clamp_val)
+        print(f"velocity norm: mean/std {vel_mean:.4f}/{vel_std:.4f} (clamp {clamp_val})")
+        dm = MultiSuiteVelocityDataModule(
+            nbody_arrs, mgas_arrs, cosmo_all, flat, vel_mean, vel_std,
+            clamp_val=clamp_val, val_split=nf_cfg["data"].get("val_split", 0.2),
+            batch_size=nf_train["batch_size"], num_workers=nf_train.get("num_workers", 4),
+            seed=nf_train.get("seed", 42), input_noise_std=nf_train.get("input_noise_std", 0.0))
+    else:
+        mgas_src, cosmo_all, flat = load_nf_pool(nf_data)
+        mgas_mean, mgas_std = nf_mgas_stats(nf_data)
+        print(f"NF Mgas norm (shared norm3d gas): mean/std {mgas_mean:.4f}/{mgas_std:.4f}")
+        dm = MultiSuiteNFDataModule(
+            mgas_src, cosmo_all, flat, mgas_mean, mgas_std,
+            val_split=nf_cfg["data"].get("val_split", 0.2),
+            batch_size=nf_train["batch_size"], num_workers=nf_train.get("num_workers", 4),
+            seed=nf_train.get("seed", 42), input_noise_std=nf_train.get("input_noise_std", 0.0))
     dm.setup()
 
     model = LitNFRegressor(
@@ -116,15 +134,18 @@ def main():
             start_epoch=int(nf_train.get("flow_warmup_epochs", 0)), verbose=True))
 
     trainer = pl.Trainer(
+        fast_dev_run=args.fast_dev_run,
         max_epochs=nf_train["max_epochs"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=nf_train.get("devices", 4), strategy=nf_train.get("strategy", "ddp"),
+        devices=1 if args.fast_dev_run else nf_train.get("devices", 4),
+        strategy="auto" if args.fast_dev_run else nf_train.get("strategy", "ddp"),
         precision=nf_train.get("precision", "bf16-mixed"),
         gradient_clip_val=nf_train.get("gradient_clip_val", 0.5),
         accumulate_grad_batches=nf_train.get("accumulate_grad_batches", 2),
         log_every_n_steps=nf_train.get("log_every_n_steps", 10),
-        logger=WandbLogger(project=nf_train.get("wandb_project", "latent-pipeline-nf"),
-                           name=args.run_name, log_model=False, save_dir=ckpt_dir),
+        logger=None if args.fast_dev_run else WandbLogger(
+            project=nf_train.get("wandb_project", "latent-pipeline-nf"),
+            name=args.run_name, log_model=False, save_dir=ckpt_dir),
         callbacks=callbacks)
 
     resume = nf_train.get("resume_from")

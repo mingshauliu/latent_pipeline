@@ -64,9 +64,14 @@ def main():
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--noise_std", type=float, default=None,
+                        help="override x0 noise; MUST match the ckpt's TRAINING noise_std "
+                             "(sampling adds nbody+noise_std*eps exactly as training does)")
     args = parser.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    if args.noise_std is not None:
+        cfg["training"]["noise_std"] = args.noise_std
     ic = cfg["inference"]
     norm = load_norm()
     dev = args.device if torch.cuda.is_available() else "cpu"

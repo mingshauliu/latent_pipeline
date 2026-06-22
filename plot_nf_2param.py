@@ -23,8 +23,9 @@ import torch
 from torch.utils.data import DataLoader
 import yaml
 
-from data import load_nf_pool, nf_mgas_stats
-from nf.module import LitNFRegressor, MultiSuiteNFDataModule
+from data import load_nf_pool, nf_mgas_stats, load_cache_pool, velocity_stats
+from nf.module import (LitNFRegressor, MultiSuiteNFDataModule,
+                       MultiSuiteVelocityDataModule)
 from nf.predict import predict_with_uncertainty
 
 
@@ -51,12 +52,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/config.yaml")
     ap.add_argument("--checkpoint", default=None)
-    ap.add_argument("--data_mode", choices=["real", "synth"], default=None)
+    ap.add_argument("--data_mode", choices=["real", "synth", "velocity"], default=None)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     with open(args.config) as f:
-        cfg = yaml.safe_load(f)["nf"]
+        full_cfg = yaml.safe_load(f)
+    cfg = full_cfg["nf"]
     nf_data, nf_train = cfg["data"], cfg["training"]
     if args.data_mode:
         nf_data["mode"] = args.data_mode
@@ -70,13 +72,26 @@ def main():
     for p in model.parameters():
         p.requires_grad_(False)
 
-    mgas_src, cosmo_all, flat = load_nf_pool(nf_data)
-    mgas_mean, mgas_std = nf_mgas_stats(nf_data)
-    dm = MultiSuiteNFDataModule(
-        mgas_src, cosmo_all, flat, mgas_mean, mgas_std,
-        val_split=nf_data.get("val_split", 0.2),
-        batch_size=cfg.get("inference", {}).get("batch_size", 2),
-        num_workers=0, seed=nf_train.get("seed", 42))
+    if mode == "velocity":
+        dcfg = full_cfg["data"]
+        clamp_val = dcfg.get("clamp_val", 10.0)
+        nbody_arrs, mgas_arrs, cosmo_all, flat = load_cache_pool(dcfg)
+        vel_mean, vel_std = velocity_stats(
+            dcfg, cache_path=nf_data.get("velocity_stats", "cached/norm_velocity.npz"),
+            clamp_val=clamp_val)
+        dm = MultiSuiteVelocityDataModule(
+            nbody_arrs, mgas_arrs, cosmo_all, flat, vel_mean, vel_std,
+            clamp_val=clamp_val, val_split=nf_data.get("val_split", 0.2),
+            batch_size=cfg.get("inference", {}).get("batch_size", 2),
+            num_workers=0, seed=nf_train.get("seed", 42))
+    else:
+        mgas_src, cosmo_all, flat = load_nf_pool(nf_data)
+        mgas_mean, mgas_std = nf_mgas_stats(nf_data)
+        dm = MultiSuiteNFDataModule(
+            mgas_src, cosmo_all, flat, mgas_mean, mgas_std,
+            val_split=nf_data.get("val_split", 0.2),
+            batch_size=cfg.get("inference", {}).get("batch_size", 2),
+            num_workers=0, seed=nf_train.get("seed", 42))
     dm.setup()
     loader = DataLoader(dm.val_ds, batch_size=2, shuffle=False, num_workers=0)
     print(f"Val (held-out) samples: {len(dm.val_ds)}")
