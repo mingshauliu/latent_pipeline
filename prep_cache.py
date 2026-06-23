@@ -26,6 +26,9 @@ from numpy.lib.format import open_memmap
 
 MGAS_TMPL = "/mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy"
 NBODY_TMPL = "/mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_{suite}_LH_128_z=0.0.npy"
+# N-body DM peculiar-velocity grids voxelised by voxelise/voxelise_nbody_vel.py
+# (mass-weighted mean |v| per voxel, km/s; --stack output). Extra FM input channel.
+NBODYVEL_TMPL = "/mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_{suite}_LH_128_z=0.0.npy"
 PARAM_TMPL = "/mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt"
 NORM3D = "/mnt/home/mliu1/ceph/norm3d.npy"
 OUT_DIR = "/mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm"
@@ -71,6 +74,33 @@ def process_suite_nbody(suite, nb_m, nb_s, out_dir, log_every=100):
     return n
 
 
+# N-body velocity is a mass-weighted MEAN |v| (intensive, km/s) -> NO suite volume/mass
+# correction (unlike the Mtot SUM which needed the Astrid (128/25)^3 div). One global
+# norm3d 'nbodyVel' stat (log1p mean 4.814 / std 0.617) covers all suites.
+def normalise_vel(raw, mean, std):
+    """log1p -> shared norm3d nbodyVel z-score. float32 out."""
+    return ((np.log1p(raw.astype(np.float32)) - np.float32(mean)) / np.float32(std)).astype(np.float32)
+
+
+def process_suite_vel(suite, vn_m, vn_s, out_dir, log_every=100):
+    vn_in = np.load(NBODYVEL_TMPL.format(suite=suite), mmap_mode="r")
+    n = len(vn_in)
+    out_path = os.path.join(out_dir, f"NbodyVel_norm_{suite}_LH_128_z=0.0.npy")
+    vn_out = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(n, GRID, GRID, GRID))
+    print(f"\n[{suite}] {n} NbodyVel cubes (log1p+norm3d nbodyVel) -> {os.path.basename(out_path)}")
+    s = q = 0.0
+    for i in range(n):
+        vnn = normalise_vel(np.asarray(vn_in[i]), vn_m, vn_s)
+        vn_out[i] = vnn
+        s += float(vnn.mean()); q += float((vnn ** 2).mean())
+        if (i + 1) % log_every == 0:
+            print(f"  {suite} nbodyvel {i+1}/{n}", flush=True)
+    vn_out.flush(); del vn_out
+    mean, std = s / n, (q / n - (s / n) ** 2) ** 0.5
+    print(f"  [{suite}] NbodyVel_norm pool mean~{mean:+.3f} std~{std:.3f} | wrote {out_path}")
+    return n
+
+
 def process_suite(suite, mg_m, mg_s, cos_m, cos_s, out_dir, log_every=100):
     mg_in = np.load(MGAS_TMPL.format(suite=suite), mmap_mode="r")
     params = np.loadtxt(PARAM_TMPL.format(suite=suite)).astype(np.float32)
@@ -103,6 +133,9 @@ def main():
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--no_nbody", action="store_true", help="skip Nbody overdensity cache")
     ap.add_argument("--no_mgas", action="store_true", help="skip Mgas cache (Nbody only)")
+    ap.add_argument("--with_vel", action="store_true",
+                    help="ALSO cache the N-body velocity channel (requires voxelise/"
+                         "voxelise_nbody_vel.py --stack output to exist first)")
     args = ap.parse_args()
 
     norm = np.load(NORM3D, allow_pickle=True).item()
@@ -120,12 +153,20 @@ def main():
         nb_m, nb_s = float(norm["nbody"]["mean"]), float(norm["nbody"]["std"])
         print(f"norm3d nbody mean/std = {nb_m:.4f}/{nb_s:.4f} | Astrid div = {NBODY_SUITE_DIV['Astrid']:.6f}")
 
+    # N-body velocity channel (opt-in): shared norm3d 'nbodyVel' stats, no suite div.
+    vn_m = vn_s = None
+    if args.with_vel:
+        vn_m, vn_s = float(norm["nbodyVel"]["mean"]), float(norm["nbodyVel"]["std"])
+        print(f"norm3d nbodyVel mean/std = {vn_m:.4f}/{vn_s:.4f} (no suite div)")
+
     counts = {}
     for s in args.suites:
         if not args.no_mgas:
             counts[s] = process_suite(s, mg_m, mg_s, cos_m, cos_s, args.out, args.log_every)
         if not args.no_nbody:
             counts[s] = process_suite_nbody(s, nb_m, nb_s, args.out, args.log_every)
+        if args.with_vel:
+            counts[s] = process_suite_vel(s, vn_m, vn_s, args.out, args.log_every)
 
     meta = dict(
         mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
@@ -138,19 +179,33 @@ def main():
     if nb_m is not None:
         meta["nbody_mean"] = np.float32(nb_m)
         meta["nbody_std"] = np.float32(nb_s)
+    if vn_m is not None:
+        meta["nbodyvel_mean"] = np.float32(vn_m)
+        meta["nbodyvel_std"] = np.float32(vn_s)
+        meta["nbodyvel_transform"] = np.array("log1p+zscore(norm3d nbodyVel); no suite div (mean |v|)")
     np.savez(os.path.join(args.out, "norm_meta.npz"), **meta)
 
     # Mirror stats into the repo-local norm_latent.npz so infer.py picks up the
-    # SAME normalisation (nbody overdensity, mgas norm3d gas, cosmo param[:2]).
-    if nb_m is not None:
+    # SAME normalisation. MERGE-and-update (don't clobber): preserve existing keys and
+    # overlay whatever this run computed -> e.g. `--with_vel --no_nbody` keeps the prior
+    # nbody/mgas stats while adding nbodyvel.
+    if nb_m is not None or vn_m is not None:
         local = "cached/norm_latent.npz"
         os.makedirs(os.path.dirname(local), exist_ok=True)
-        np.savez(local,
-                 nbody_mean=np.float32(nb_m), nbody_std=np.float32(nb_s),
-                 mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
-                 cosmo_mean=cos_m, cosmo_std=cos_s,
-                 nbody_transform=np.array("scalar-corrected-norm3d"))
-        print(f"Wrote {local} (nbody scalar-corrected norm3d stats for infer)")
+        local_kw = {}
+        if os.path.exists(local):
+            local_kw = {k: v for k, v in np.load(local, allow_pickle=True).items()}
+        # mgas/cosmo always available this run
+        local_kw.update(mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
+                        cosmo_mean=cos_m, cosmo_std=cos_s)
+        if nb_m is not None:
+            local_kw.update(nbody_mean=np.float32(nb_m), nbody_std=np.float32(nb_s),
+                            nbody_transform=np.array("scalar-corrected-norm3d"))
+        if vn_m is not None:
+            local_kw.update(nbodyvel_mean=np.float32(vn_m), nbodyvel_std=np.float32(vn_s))
+        np.savez(local, **local_kw)
+        print(f"Wrote {local} (infer norm stats"
+              + (" + nbodyvel" if vn_m is not None else "") + ")")
     print(f"\nDone. cache -> {args.out}")
 
 

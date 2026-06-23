@@ -23,7 +23,16 @@ except ImportError:
 # ── augmentation ──────────────────────────────────────────────────────────────
 
 class RandomRotateFlip3D:
+    """Periodic-box augmentation for (B,C,D,H,W) cubes: random 90-deg rotation, axis
+    flips, and (optional) PBC roll shift. The SAME transform is applied to every tensor
+    so nbody/mgas stay voxel-aligned. All ops are symmetries of the periodic simulation
+    box (circular padding in the net keeps them exact), so they multiply effective data
+    without distorting the physics."""
+
     PAIRS = [(2, 3), (3, 4), (2, 4)]
+
+    def __init__(self, pbc_shift=True):
+        self.pbc_shift = pbc_shift
 
     def __call__(self, *tensors):
         k = torch.randint(0, 4, (1,)).item()
@@ -32,6 +41,11 @@ class RandomRotateFlip3D:
         for d in (2, 3, 4):
             if torch.rand(1).item() < 0.5:
                 tensors = tuple(torch.flip(t, [d]) for t in tensors)
+        if self.pbc_shift:
+            dims = (2, 3, 4)
+            sizes = tensors[0].shape  # (B,C,D,H,W)
+            shifts = [torch.randint(0, sizes[d], (1,)).item() for d in dims]
+            tensors = tuple(torch.roll(t, shifts=shifts, dims=dims) for t in tensors)
         return tensors
 
 
@@ -90,6 +104,11 @@ class FlowMatchingModel(pl.LightningModule):
         res = d["resolution"]
         self.box_size = d["box_size"] * (crop / res) if crop and crop < res else d["box_size"]
         self.latent_dim = m.get("latent_dim", 8)
+        # Extra N-body VELOCITY input channel (separate model variant). When true the
+        # dataloader yields a 4-tuple (nbody, mgas, cosmo, vel) and the UNet input is
+        # cat([x_t, nbody, vel]) -> model.in_channels MUST be 3. Velocity is a STATIC
+        # conditioning channel (NOT part of the x0/x1 flow). Default false = baseline.
+        self.use_velocity = bool(d.get("use_velocity", False))
 
         # Variational (beta-VAE) latent: GasEncoder -> (mu, logvar), z reparametrised,
         # KL(q||N(0,I)) added to the recon loss. beta warms up linearly; per-dim
@@ -117,7 +136,7 @@ class FlowMatchingModel(pl.LightningModule):
         )
         if t.get("gradient_checkpointing", False):
             self.net.enable_gradient_checkpointing()
-        self.aug = RandomRotateFlip3D()
+        self.aug = RandomRotateFlip3D(pbc_shift=bool(t.get("aug_pbc_shift", True)))
 
         ema_cfg = t.get("ema") or {}
         self.ema_enabled = bool(ema_cfg.get("enabled", False))
@@ -216,9 +235,16 @@ class FlowMatchingModel(pl.LightningModule):
         return self.kl_beta * min(1.0, self.current_epoch / self.kl_warmup_epochs)
 
     def _step(self, batch, augment=False, sample_latent=False):
-        nbody, mgas, cosmo = batch
+        vel = None
+        if self.use_velocity:
+            nbody, mgas, cosmo, vel = batch
+        else:
+            nbody, mgas, cosmo = batch
         if augment:
-            nbody, mgas = self.aug(nbody, mgas)
+            if vel is not None:
+                nbody, mgas, vel = self.aug(nbody, mgas, vel)   # shared transform -> aligned
+            else:
+                nbody, mgas = self.aug(nbody, mgas)
         B = nbody.size(0)
         latent, kl = self._encode_latent(mgas, sample_latent)
         if self.time_sampling == "logitnormal":
@@ -229,7 +255,8 @@ class FlowMatchingModel(pl.LightningModule):
         x1 = mgas
         t_exp = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_exp) * x0 + t_exp * x1
-        pred = self(torch.cat([x_t, nbody], 1), t, cosmo, latent)
+        cond_in = [x_t, nbody] if vel is None else [x_t, nbody, vel]
+        pred = self(torch.cat(cond_in, 1), t, cosmo, latent)
         return F.mse_loss(pred, x1 - x0), kl, pred, cosmo
 
     def training_step(self, batch, _):
@@ -369,14 +396,21 @@ class FlowMatchingModel(pl.LightningModule):
     def _log_xcorr(self, batch):
         # Oracle latent: encode the TRUE Mgas (upper bound on FM transport given
         # the right latent). Inference without truth uses latent_mode in infer.py.
-        nbody, mgas, cosmo = batch
+        vel = None
+        if self.use_velocity:
+            nbody, mgas, cosmo, vel = batch
+        else:
+            nbody, mgas, cosmo = batch
         nb32, cosmo32 = nbody.float(), cosmo.float()
         B, dev = nb32.size(0), nb32.device
         # oracle latent = encode the TRUE Mgas; variational uses the mean (mu).
         latent, _ = self._encode_latent(mgas.float(), sample_latent=False)
         x0 = nb32 + torch.randn_like(nb32) * self.noise_std if self.noise_std > 0 else nb32.clone()
-        buf = torch.empty(B, 2, *nb32.shape[2:], device=dev, dtype=torch.float32)
+        cw = 3 if vel is not None else 2   # flow(1) + nbody(1) [+ vel(1)] static channels
+        buf = torch.empty(B, cw, *nb32.shape[2:], device=dev, dtype=torch.float32)
         buf[:, 1:2] = nb32
+        if vel is not None:
+            buf[:, 2:3] = vel.float()
         t_span = torch.linspace(0.0, 1.0, self.xcorr_steps + 1, device=dev)
         with torch.amp.autocast("cuda", enabled=False):
             x = odeint(self._ode_func(cosmo32, latent.float(), buf), x0, t_span,
@@ -402,15 +436,20 @@ class FlowMatchingModel(pl.LightningModule):
             print(f"  pk_ratio failed: {e}")
 
     def sample(self, nbody, cosmo, latent, num_steps=100, method='euler',
-               rtol=1e-4, atol=1e-4, offload_skips=False):
+               rtol=1e-4, atol=1e-4, offload_skips=False, vel=None):
         """Integrate Nbody -> Mgas. `latent` is (B, latent_dim) supplied by caller
         (mean=zeros, sampled from a prior, or encoded from a reference cube).
+        `vel` (B,1,D,D,D) = the N-body velocity conditioning channel (required when the
+        model was trained with use_velocity; ignored otherwise).
         offload_skips: CPU-offload skip connections (use for large 256^3 cubes)."""
         self.eval()
         B, dev = nbody.size(0), nbody.device
         x0 = nbody + torch.randn_like(nbody) * self.noise_std if self.noise_std > 0 else nbody.clone()
-        buf = torch.empty(B, 2, *nbody.shape[2:], device=dev, dtype=nbody.dtype)
+        cw = 3 if vel is not None else 2   # flow(1) + nbody(1) [+ vel(1)] static channels
+        buf = torch.empty(B, cw, *nbody.shape[2:], device=dev, dtype=nbody.dtype)
         buf[:, 1:2] = nbody
+        if vel is not None:
+            buf[:, 2:3] = vel.to(buf.dtype)
         ADAPTIVE = {'dopri5', 'dopri8', 'bosh3', 'fehlberg2', 'adaptive_heun'}
         t_span = (torch.tensor([0.0, 1.0], device=dev) if method in ADAPTIVE
                   else torch.linspace(0.0, 1.0, num_steps + 1, device=dev))

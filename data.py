@@ -219,11 +219,37 @@ def load_cache_pool(d):
     return nbody_arrs, mgas_arrs, cosmo_all, flat
 
 
+def load_velocity_arrs(d):
+    """Per-suite N-body VELOCITY channel from the FM cache (extra conditioning input).
+
+    `NbodyVel_norm_{suite}_LH_128_z=0.0.npy` — voxelised mass-weighted mean |v| (km/s),
+    log1p + norm3d 'nbodyVel' z-score (prep_cache.py --with_vel). Returns a list of
+    per-suite mmaps aligned with load_cache_pool's suite order, so vel_arrs[si][li]
+    matches nbody_arrs[si][li]. Raises if the cache is missing (run --with_vel first)."""
+    cache = d["cache_dir"]
+    vel_arrs = []
+    for suite in d["suites"]:
+        p = os.path.join(cache, f"NbodyVel_norm_{suite}_LH_128_z=0.0.npy")
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"velocity cache missing: {p}. Voxelise (voxelise/voxelise_nbody_vel.py "
+                f"--stack) then `python prep_cache.py --with_vel`.")
+        vel = np.load(p, mmap_mode="r")
+        vel_arrs.append(vel)
+        print(f"  [cache {suite}] nbodyvel(norm) {vel.shape}")
+    return vel_arrs
+
+
 class CachedFMDataset(Dataset):
-    """Pre-normed Nbody -> pre-normed Mgas + pre-normed cosmo (all cached). PBC roll aug."""
+    """Pre-normed Nbody -> pre-normed Mgas + pre-normed cosmo (all cached). PBC roll aug.
+
+    If `vel_arrs` is given (N-body velocity channel, load_velocity_arrs), __getitem__
+    returns a 4th element `vel` (1,D,D,D) — the velocity conditioning channel, clamped
+    and augmented with the SAME shifts/crop as nbody/mgas so all fields stay aligned.
+    Default (vel_arrs=None) returns the legacy (nb, mg, cosmo) 3-tuple unchanged."""
 
     def __init__(self, nbody_arrs, mgas_arrs, cosmo_all, flat, indices,
-                 crop_size=None, augment=True, clamp_val=10.0):
+                 crop_size=None, augment=True, clamp_val=10.0, vel_arrs=None):
         self.nbody_arrs = nbody_arrs
         self.mgas_arrs = mgas_arrs
         self.cosmo_all = cosmo_all
@@ -231,6 +257,7 @@ class CachedFMDataset(Dataset):
         self.indices = np.asarray(indices)
         self.crop_size = crop_size
         self.augment = augment
+        self.vel_arrs = vel_arrs
         # Clamp the heavy-tailed Nbody overdensity z-score (max ~+21 = 45 sigma at
         # DM halo cores) to +/- clamp_val. Caps the rare outlier voxels that drive
         # per-batch MSE to ~1e4 and blow up the converged FM (see CLAUDE.md). Mgas
@@ -245,25 +272,29 @@ class CachedFMDataset(Dataset):
         si, li = self.flat[g]
         nb = np.array(self.nbody_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
         mg = np.array(self.mgas_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
+        fields = [nb, mg]
+        if self.vel_arrs is not None:
+            fields.append(np.array(self.vel_arrs[si][li], dtype=np.float32))  # velocity channel
         if self.clamp_val is not None:
             c = float(self.clamp_val)
-            np.clip(nb, -c, c, out=nb)
-            np.clip(mg, -c, c, out=mg)
-        nb = torch.from_numpy(nb)
-        mg = torch.from_numpy(mg)
-        D = nb.shape[0]
+            for f in fields:
+                np.clip(f, -c, c, out=f)
+        fields = [torch.from_numpy(f) for f in fields]
+        D = fields[0].shape[0]
+        # one shared aug (same crop window / roll shift) across all fields -> alignment kept
         if self.crop_size and D > self.crop_size:
             for ax in range(3):
                 s = random.randint(0, D - 1)
                 ix = torch.arange(s, s + self.crop_size) % D
-                nb = nb.index_select(ax, ix)
-                mg = mg.index_select(ax, ix)
+                fields = [f.index_select(ax, ix) for f in fields]
         elif self.augment:
             shifts = (random.randint(0, D - 1), random.randint(0, D - 1), random.randint(0, D - 1))
-            nb = torch.roll(nb, shifts, dims=(0, 1, 2))
-            mg = torch.roll(mg, shifts, dims=(0, 1, 2))
+            fields = [torch.roll(f, shifts, dims=(0, 1, 2)) for f in fields]
         cosmo = torch.from_numpy(self.cosmo_all[g].astype(np.float32))
-        return nb.unsqueeze(0), mg.unsqueeze(0), cosmo
+        out = [fields[0].unsqueeze(0), fields[1].unsqueeze(0), cosmo]
+        if self.vel_arrs is not None:
+            out.append(fields[2].unsqueeze(0))   # vel (1,D,D,D)
+        return tuple(out)
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────

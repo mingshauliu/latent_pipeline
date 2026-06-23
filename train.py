@@ -14,7 +14,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 import yaml
 
 from data import (load_suite_pool, compute_field_stats, compute_cosmo_stats,
-                  MultiSuiteFMDataset, load_cache_pool, CachedFMDataset)
+                  MultiSuiteFMDataset, load_cache_pool, CachedFMDataset,
+                  load_velocity_arrs)
 from module import FlowMatchingModel
 
 NORM_PATH = "cached/norm_latent.npz"
@@ -51,11 +52,20 @@ def warm_load_partial(model, src_sd):
     source time(64)+cosmo(64) input columns (latent columns stay freshly initialised).
     EMA shadow is intentionally NOT loaded — it rebuilds from current weights."""
     own = model.state_dict()
-    copied, skipped = [], []
+    copied, skipped, chan = [], [], []
     for k, v in src_sd.items():
         if k in own and own[k].shape == v.shape:
             own[k].copy_(v)
             copied.append(k)
+        elif (k in own and v.dim() == own[k].dim() and v.dim() >= 2
+              and own[k].shape[0] == v.shape[0] and own[k].shape[2:] == v.shape[2:]
+              and own[k].shape[1] > v.shape[1]):
+            # input-channel expansion (e.g. UNet in_channels 2->3 when adding the
+            # velocity channel): copy the existing [x_t, nbody] input cols, leave the
+            # new vel col freshly initialised. Hits net.enc1.conv1 + net.enc1.skip.
+            c = v.shape[1]
+            own[k][:, :c].copy_(v)
+            chan.append((k, tuple(v.shape), tuple(own[k].shape)))
         else:
             skipped.append((k, tuple(v.shape), tuple(own[k].shape) if k in own else None))
 
@@ -84,7 +94,9 @@ def warm_load_partial(model, src_sd):
 
     model.load_state_dict(own, strict=True)
     print(f"Partial warm-start: copied {len(copied)} matching tensors; "
-          f"{len(skipped)} reshaped (smart-init/fresh):")
+          f"{len(chan)} input-channel-expanded; {len(skipped)} reshaped (smart-init/fresh):")
+    for k, sshape, dshape in chan:
+        print(f"  in-chan-expand {k}: src{sshape} -> dst{dshape} (extra col fresh)")
     for k, sshape, dshape in skipped:
         print(f"  reshaped {k}: src{sshape} -> dst{dshape}")
 
@@ -110,14 +122,20 @@ def main():
         crop = None
 
     use_cache = d.get("use_cache", False)
+    use_velocity = d.get("use_velocity", False)
     if use_cache:
         print("Loading pre-normalised cache pool:")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_cache_pool(d)
         clamp_val = d.get("clamp_val", 10.0)
+        vel_arrs = load_velocity_arrs(d) if use_velocity else None
+        if use_velocity:
+            print(f"  + velocity channel ({len(vel_arrs)} suites) -> in_channels must be 3")
         ds_cls = lambda ix, aug: CachedFMDataset(  # noqa: E731
             nbody_arrs, mgas_arrs, cosmo_all, flat, ix,
-            crop_size=crop, augment=aug, clamp_val=clamp_val)
+            crop_size=crop, augment=aug, clamp_val=clamp_val, vel_arrs=vel_arrs)
     else:
+        if use_velocity:
+            raise ValueError("use_velocity requires use_cache=true (velocity cache path)")
         print("Loading multi-suite pool (lazy norm):")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_suite_pool(d)
         norm = build_norm(d, nbody_arrs, mgas_arrs, cosmo_all, flat)

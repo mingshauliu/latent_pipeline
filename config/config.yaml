@@ -49,10 +49,16 @@ model:
 training:
   max_epochs: 2000
   batch_size: 2
-  noise_std: 0.2          # 2026-06-19: 0.1 -> 0.2 (user; matches encoder3D xcorr~0.9
-                          # recipe — more stochastic budget to paint small-scale Mgas).
+  noise_std: 0.1          # 2026-06-23: 0.2 -> 0.1 for aux warm-start from ep486 (trained
+                          # @0.1). Keeps v_pred close to critic's clean v=Mgas-Nbody +
+                          # smooth warm-start. (0.2 = encoder3D high-stochastic recipe.)
   time_sampling: logitnormal  # t=sigmoid(N(0,1)) — focus the hard t~0.5 (SD3/EDM),
                           # the encoder3D recipe. 'uniform' = original t~U(0,1).
+  aug_pbc_shift: true     # 2026-06-23: PBC roll-shift augmentation (on top of the
+                          # always-on rot90/flip). Random per-batch torch.roll over the
+                          # 3 spatial dims — a periodic-box symmetry (circular padding
+                          # keeps it exact), de-localises structure -> regularises the
+                          # latent + de-memorises. false = rot/flip only.
   lr: 6.0e-4               # 2026-06-16: 3e-4 -> 6e-4. data.py log1p+z-scores both
                           # fields (zero-mean/unit-var) -> FM target mean~0, init
                           # loss ~2 (not ~16 as in upscaling's non-zero-mean data).
@@ -81,8 +87,8 @@ training:
   # Frozen NF p(cosmo | v=Mgas-Nbody) judges the FM-predicted v_pred:
   # aux = MSE(critic(v_pred), cosmo). OFF by default (null) -> fully backward
   # compatible; never persisted in the ckpt; never used at sampling.
-  velocity_nf_ckpt: null            # e.g. nf_ck_velocity/best.ckpt -> enables aux
-  vel_aux_weight: 0.0               # small, e.g. 0.05 when enabling
+  velocity_nf_ckpt: nf_ck_velocity/nf-731--2.4816.ckpt  # enables aux (velNF R² Om0.997/s8 0.869)
+  vel_aux_weight: 0.05              # small, e.g. 0.05 when enabling
   vel_aux_warmup_epochs: 5          # quick linear ramp 0 -> vel_aux_weight
   velocity_stats: cached/norm_velocity.npz  # MUST match the velocity-NF training stats
   # ---- variational (KL) latent — only used when model.variational: true ----
@@ -97,7 +103,11 @@ training:
   # val 0.013353, not plateaued). resume_from restores optimiser+scheduler+epoch
   # -> picks up the cosine toward ep2000. lr still ~5.7e-4 (T_max=1985 barely
   # annealed), which is fine — high lr is still finding improvement here.
-  resume_from: latent-pipeline/sv6mp9wt/checkpoints/last.ckpt
+  # 2026-06-23: enable velocity-NF aux loss -> warm-start (weights only, fresh optimiser)
+  # from current best FM ep486 so the new objective starts from the converged minimum.
+  # resume_from MUST be null for init_from to fire (train.py guard).
+  init_from: latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt
+  resume_from: null
   wandb_project: latent-pipeline
   ema:
     enabled: true

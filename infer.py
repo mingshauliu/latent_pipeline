@@ -55,6 +55,12 @@ def nbody_div(name, cfg):
     return 1.0
 
 
+def norm_vel(v, mean, std):
+    """N-body velocity channel: log1p + norm3d nbodyVel z-score (no suite div — mean |v|
+    is intensive). MUST match prep_cache.normalise_vel."""
+    return (np.log1p(v.astype(np.float32)) - mean) / std
+
+
 def denorm_field(x, mean, std):
     return np.expm1(x * std + mean)
 
@@ -91,6 +97,13 @@ def main():
     # MUST match training (data.CachedFMDataset clamps both fields to +/-clamp_val
     # before the net sees them). Sampling on un-clamped heavy-tail Nbody is OOD.
     clamp_val = cfg["data"].get("clamp_val", 10.0)
+    use_velocity = cfg["data"].get("use_velocity", False)
+    if use_velocity:
+        assert "nbodyvel_mean" in norm, (
+            "use_velocity set but cached/norm_latent.npz lacks nbodyvel stats — "
+            "run `python prep_cache.py --with_vel` first")
+        print(f"velocity channel ON (norm3d nbodyVel {float(norm['nbodyvel_mean']):.3f}/"
+              f"{float(norm['nbodyvel_std']):.3f}); sources need a vel_path")
 
     gauss = None
     if mode == "gaussian":
@@ -112,6 +125,10 @@ def main():
         name = src["name"]
         div = nbody_div(name, cfg)
         nbody = np.load(src["nbody_path"], mmap_mode="r")
+        vel_arr = None
+        if use_velocity:
+            assert src.get("vel_path"), f"[{name}] use_velocity needs src.vel_path (Grids_Vcdm_Nbody)"
+            vel_arr = np.load(src["vel_path"], mmap_mode="r")
         cosmo_all = np.loadtxt(src["param_path"]).astype(np.float32)[:, :cfg["data"].get("n_cosmo", 2)]
         mgas_ref = np.load(src["mgas_path"], mmap_mode="r") if (mode == "encode" and src.get("mgas_path")) else None
         n_take = src.get("n_samples") or len(nbody)
@@ -130,6 +147,13 @@ def main():
                 if clamp_val is not None:
                     np.clip(nb, -clamp_val, clamp_val, out=nb)
                 nb_t = torch.from_numpy(nb)[None, None].to(dev)
+                vel_t = None
+                if use_velocity:
+                    vv = norm_vel(np.asarray(vel_arr[i], dtype=np.float32),
+                                  norm["nbodyvel_mean"], norm["nbodyvel_std"])
+                    if clamp_val is not None:
+                        np.clip(vv, -clamp_val, clamp_val, out=vv)
+                    vel_t = torch.from_numpy(vv)[None, None].to(dev)
                 cosmo = (cosmo_all[i] - norm["cosmo_mean"]) / norm["cosmo_std"]
                 cosmo_t = torch.from_numpy(cosmo.astype(np.float32))[None].to(dev)
 
@@ -156,7 +180,7 @@ def main():
 
                 with torch.no_grad(), torch.amp.autocast(dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
                     synth = model.sample(nb_t, cosmo_t, latent, num_steps=n_steps,
-                                         method=method, offload_skips=offload)
+                                         method=method, offload_skips=offload, vel=vel_t)
                 out = denorm_field(synth[0, 0].float().cpu().numpy(),
                                    norm["mgas_mean"], norm["mgas_std"])
                 np.save(out_path, out.astype(np.float32))
