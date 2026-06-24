@@ -142,6 +142,7 @@ class FlowMatchingModel(pl.LightningModule):
             circular_padding=m["circular_padding"],
             variational=self.variational,
             in_channels=2 if self.use_ne else 1,   # encode (Mgas, ne) jointly when on
+            latent_head=m.get("latent_head", "tanh"),  # raw|mlp drop tanh (encoder3D)
         )
         if t.get("gradient_checkpointing", False):
             self.net.enable_gradient_checkpointing()

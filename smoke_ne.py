@@ -20,13 +20,13 @@ D = 16
 CKPT = "latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt"
 
 
-def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4):
+def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tanh"):
     return dict(
         data=dict(use_ne=use_ne, use_velocity=use_vel, resolution=D, box_size=25,
                   crop_size=None, clamp_val=10, n_cosmo=2),
         model=dict(in_channels=in_ch, base_channels=8, out_channels=out_ch, cosmo_dim=2,
                    latent_dim=8, variational=False, encoder_base=encoder_base, encoder_dropout=0.0,
-                   circular_padding=True, norm_type="pixel"),
+                   circular_padding=True, norm_type="pixel", latent_head=latent_head),
         training=dict(lr=2e-4, weight_decay=1e-3, noise_std=0.1, time_sampling="logitnormal",
                       max_epochs=10, xcorr_every_n_epochs=0, xcorr_num_steps=4,
                       scheduler="cosine", warmup_epochs=0, ema=dict(enabled=False)),
@@ -82,8 +82,9 @@ def main():
     # 3. warm-load real ep486 (1-ch) -> 2-ch ne model (production base_channels=128).
     import os
     if os.path.exists(CKPT):
-        # the REAL combined config: in=4 (x_t2+nbody+vel), out=2, encoder base 16->40 (fresh).
-        cfg = mkcfg(True, 4, 2, use_vel=True, encoder_base=40)
+        # the REAL combined config: in=4 (x_t2+nbody+vel), out=2, encoder base 16->40 (fresh),
+        # latent_head=mlp (encoder3D no-tanh head -> fresh Sequential proj, warm-load skips it).
+        cfg = mkcfg(True, 4, 2, use_vel=True, encoder_base=40, latent_head="mlp")
         cfg["model"]["base_channels"] = 128
         mw = FlowMatchingModel(cfg)
         ck = torch.load(CKPT, map_location="cpu", weights_only=False)
@@ -106,6 +107,20 @@ def main():
                    torch.zeros(2, 8, device=dev), num_steps=3)
     assert s.shape[1] == 1
     print("[4] backward-compat baseline OK")
+
+    # 5. latent_head variants: tanh bounded [-1,1]; raw/mlp unbounded; grad reaches proj.
+    for h in ["tanh", "raw", "mlp"]:
+        m = FlowMatchingModel(mkcfg(True, 3, 2, latent_head=h)).to(dev)
+        assert m.gas_encoder.latent_head == h
+        x = torch.randn(2, 2, D, D, D, device=dev)   # (Mgas, ne) encode input
+        z = m.gas_encoder(x)
+        assert z.shape == (2, 8), z.shape
+        if h == "tanh":
+            assert z.abs().max() <= 1.0 + 1e-5, z.abs().max()
+        b = tuple(t.to(dev) for t in batch(True))
+        l, _, p, _ = m._step(b, augment=True, sample_latent=True); l.backward()
+        seq = type(m.gas_encoder.proj).__name__
+        print(f"[5:{h}] OK z{tuple(z.shape)} |z|max {z.abs().max():.3f} proj={seq} loss{float(l):.4f}")
     print("ALL OK")
 
 

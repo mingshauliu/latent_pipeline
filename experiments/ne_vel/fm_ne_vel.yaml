@@ -29,6 +29,10 @@ model:
   cosmo_dim: 2
   latent_dim: 8
   variational: false
+  latent_head: mlp     # encoder3D ResNetBranch head: Linear->SiLU->Linear, NO tanh.
+                       # Drops the tanh saturation that clustered suites / collapsed
+                       # the latent (ep486 tanh eff-dim 1.48/8). Encoder is fresh here
+                       # (base40 != ep486's 16) so the new head costs nothing.
   encoder_base: 40     # ~param-matched to encoder3D ResNetBranch (9.18M vs 8.27M).
                        # Encoder trains FRESH (base differs from ep486's 16); the UNet
                        # backbone still warm-starts. The bet: encoder3D-sized encoder +
@@ -48,7 +52,8 @@ training:
   gradient_clip: 1.0
   scheduler: cosine
   warmup_epochs: 5
-  accumulate_grad: 4
+  accumulate_grad: 8   # 2026-06-24: 4->8 (eff-batch 16). Averages out the single
+                       # heavy-tail (ne max|val|~8) cube that bumped fm_ne val ~3x late.
   precision: bf16-mixed
   devices: 1
   strategy: ddp

@@ -271,8 +271,14 @@ class GasEncoder(nn.Module):
     """Mgas (B,1,D,D,D) -> latent (B, latent_dim). 3 strided SE-ResNet stages,
     global avg pool, LayerNorm, project to latent_dim.
 
-    Two heads:
-      - deterministic (default): project -> latent_dim, tanh-bounded to [-1, 1].
+    Deterministic latent heads (latent_head):
+      - tanh (default): project -> latent_dim, tanh-bounded to [-1, 1]. Saturation
+        pushes encodings to corners -> discrete suite clusters + collapse.
+      - raw : project -> latent_dim, NO tanh. Same shape as tanh -> warm-loads the
+        tanh proj; unbounded (scale held by pre-fc LayerNorm + zero-init FiLM).
+        encoder3D-style continuous latent -> smoother / more overlapping suites.
+      - mlp : Linear -> SiLU -> Linear, NO tanh (encoder3D ResNetBranch head). Fresh
+        params (Sequential keys differ -> warm load reinits the head).
       - variational: project -> 2*latent_dim = (mu, logvar), NO tanh. forward
         returns (mu, logvar); the caller reparametrises z = mu + eps*exp(.5*logvar)
         and regularises with KL(q || N(0,I)). Makes infer latent_mode=sample
@@ -280,12 +286,13 @@ class GasEncoder(nn.Module):
 
     def __init__(self, latent_dim=8, base=16, dropout=0.1,
                  circular_padding=True, use_checkpoint=True, variational=False,
-                 in_channels=1):
+                 in_channels=1, latent_head="tanh"):
         super().__init__()
         pad = "circular" if circular_padding else "constant"
         self.pad_mode = pad
         self.use_checkpoint = use_checkpoint
         self.variational = variational
+        self.latent_head = "tanh" if variational else latent_head
         # in_channels=1 -> encode Mgas only (baseline). in_channels=2 -> encode the
         # stacked (Mgas, ne) target (multi-task variant); richer encode signal, may
         # resist latent collapse. The caller cats the fields before calling forward.
@@ -296,7 +303,12 @@ class GasEncoder(nn.Module):
         self.se = SEBlock3D(8*base)
         self.pool = nn.AdaptiveAvgPool3d(1)
         self.norm = nn.LayerNorm(8*base)
-        self.proj = nn.Linear(8*base, latent_dim * 2 if variational else latent_dim)
+        if (not variational) and latent_head == "mlp":
+            self.proj = nn.Sequential(
+                nn.Linear(8*base, latent_dim), nn.SiLU(),
+                nn.Linear(latent_dim, latent_dim))
+        else:
+            self.proj = nn.Linear(8*base, latent_dim * 2 if variational else latent_dim)
 
     def _ckpt(self, module, x):
         if self.use_checkpoint and self.training:
@@ -315,4 +327,4 @@ class GasEncoder(nn.Module):
         if self.variational:
             mu, logvar = o.chunk(2, dim=-1)
             return mu, logvar
-        return torch.tanh(o)
+        return torch.tanh(o) if self.latent_head == "tanh" else o
