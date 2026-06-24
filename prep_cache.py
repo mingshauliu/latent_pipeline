@@ -29,6 +29,12 @@ NBODY_TMPL = "/mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids
 # N-body DM peculiar-velocity grids voxelised by voxelise/voxelise_nbody_vel.py
 # (mass-weighted mean |v| per voxel, km/s; --stack output). Extra FM input channel.
 NBODYVEL_TMPL = "/mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_{suite}_LH_128_z=0.0.npy"
+# Electron density — already public in the CMD release (NO voxelisation needed; same
+# dir as Mtot/Mgas). Extra FM OUTPUT (target) channel for the multi-task (Mgas + ne)
+# variant. Values are tiny number densities (~1e-7 h^2/cm^3) -> norm = LOG10 (NOT log1p,
+# which is degenerate at that scale) + shared norm3d 'ne' z-score (mean -6.96/std 0.57;
+# pool log10 mean -6.94/std 0.56 matches; zscored peak ~8.8 < clamp 10).
+NE_TMPL = "/mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_ne_{suite}_LH_128_z=0.0.npy"
 PARAM_TMPL = "/mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt"
 NORM3D = "/mnt/home/mliu1/ceph/norm3d.npy"
 OUT_DIR = "/mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm"
@@ -101,6 +107,45 @@ def process_suite_vel(suite, vn_m, vn_s, out_dir, log_every=100):
     return n
 
 
+# ── electron density (ne) — FM 2nd output channel ───────────────────────────────
+# USER DECISION (2026-06-23): the public Grids_ne are tiny number densities (~1e-7),
+# so log1p(ne)~ne~0 (std 0 -> dead target). Use LOG10 + the shared norm3d 'ne' z-score
+# (mean -6.96/std 0.57; encoder3D-proven, matches the public-grid scale). NO suite div
+# (ne is intensive). NE_FLOOR guards log10(0) at empty/SF voxels (set ne=0 -> floor).
+NE_FLOOR = 1e-12
+
+
+def normalise_ne(raw, mean, std):
+    """log10 (clip to NE_FLOOR) then z-score with shared norm3d 'ne' stats. float32 out."""
+    v = np.clip(raw.astype(np.float32), NE_FLOOR, None)
+    return ((np.log10(v) - np.float32(mean)) / np.float32(std)).astype(np.float32)
+
+
+def process_suite_ne(suite, ne_m, ne_s, out_dir, log_every=100):
+    ne_in = np.load(NE_TMPL.format(suite=suite), mmap_mode="r")
+    n = len(ne_in)
+    out_path = os.path.join(out_dir, f"Ne_norm_{suite}_LH_128_z=0.0.npy")
+    ne_out = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(n, GRID, GRID, GRID))
+    print(f"\n[{suite}] {n} ne cubes (log10+norm3d ne) -> {os.path.basename(out_path)}")
+    s = q = 0.0
+    amax = 0.0
+    for i in range(n):
+        nen = normalise_ne(np.asarray(ne_in[i]), ne_m, ne_s)
+        ne_out[i] = nen
+        s += float(nen.mean()); q += float((nen ** 2).mean())
+        amax = max(amax, float(np.abs(nen).max()))
+        if (i + 1) % log_every == 0:
+            print(f"  {suite} ne {i+1}/{n}", flush=True)
+    ne_out.flush(); del ne_out
+    mean, std = s / n, (q / n - (s / n) ** 2) ** 0.5
+    # max|val| reported so we can check whether clamp_val=10 would truncate the ne
+    # peak (cluster cores) -> would impede the encoder. If amax > clamp_val, raise the
+    # target clamp or use a per-field clamp (tight on Nbody input, loose on targets).
+    print(f"  [{suite}] Ne_norm pool mean~{mean:+.3f} std~{std:.3f} max|val|~{amax:.2f} "
+          f"| wrote {out_path}")
+    return n
+
+
 def process_suite(suite, mg_m, mg_s, cos_m, cos_s, out_dir, log_every=100):
     mg_in = np.load(MGAS_TMPL.format(suite=suite), mmap_mode="r")
     params = np.loadtxt(PARAM_TMPL.format(suite=suite)).astype(np.float32)
@@ -136,6 +181,9 @@ def main():
     ap.add_argument("--with_vel", action="store_true",
                     help="ALSO cache the N-body velocity channel (requires voxelise/"
                          "voxelise_nbody_vel.py --stack output to exist first)")
+    ap.add_argument("--with_ne", action="store_true",
+                    help="ALSO cache the electron-density (ne) target channel from the "
+                         "public CMD Grids_ne (no voxelise). log10 + norm3d 'ne' z-score.")
     args = ap.parse_args()
 
     norm = np.load(NORM3D, allow_pickle=True).item()
@@ -159,6 +207,12 @@ def main():
         vn_m, vn_s = float(norm["nbodyVel"]["mean"]), float(norm["nbodyVel"]["std"])
         print(f"norm3d nbodyVel mean/std = {vn_m:.4f}/{vn_s:.4f} (no suite div)")
 
+    # ne (opt-in): log10 + shared norm3d 'ne' z-score (public Grids_ne, no voxelise).
+    ne_m = ne_s = None
+    if args.with_ne:
+        ne_m, ne_s = float(norm["ne"]["mean"]), float(norm["ne"]["std"])
+        print(f"norm3d ne mean/std = {ne_m:.4f}/{ne_s:.4f} (log10, no suite div)")
+
     counts = {}
     for s in args.suites:
         if not args.no_mgas:
@@ -167,6 +221,8 @@ def main():
             counts[s] = process_suite_nbody(s, nb_m, nb_s, args.out, args.log_every)
         if args.with_vel:
             counts[s] = process_suite_vel(s, vn_m, vn_s, args.out, args.log_every)
+        if args.with_ne:
+            counts[s] = process_suite_ne(s, ne_m, ne_s, args.out, args.log_every)
 
     meta = dict(
         mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
@@ -183,13 +239,17 @@ def main():
         meta["nbodyvel_mean"] = np.float32(vn_m)
         meta["nbodyvel_std"] = np.float32(vn_s)
         meta["nbodyvel_transform"] = np.array("log1p+zscore(norm3d nbodyVel); no suite div (mean |v|)")
+    if ne_m is not None:
+        meta["ne_mean"] = np.float32(ne_m)
+        meta["ne_std"] = np.float32(ne_s)
+        meta["ne_transform"] = np.array("log10+zscore(norm3d ne); no suite div; public Grids_ne")
     np.savez(os.path.join(args.out, "norm_meta.npz"), **meta)
 
     # Mirror stats into the repo-local norm_latent.npz so infer.py picks up the
     # SAME normalisation. MERGE-and-update (don't clobber): preserve existing keys and
     # overlay whatever this run computed -> e.g. `--with_vel --no_nbody` keeps the prior
     # nbody/mgas stats while adding nbodyvel.
-    if nb_m is not None or vn_m is not None:
+    if nb_m is not None or vn_m is not None or ne_m is not None:
         local = "cached/norm_latent.npz"
         os.makedirs(os.path.dirname(local), exist_ok=True)
         local_kw = {}
@@ -203,9 +263,12 @@ def main():
                             nbody_transform=np.array("scalar-corrected-norm3d"))
         if vn_m is not None:
             local_kw.update(nbodyvel_mean=np.float32(vn_m), nbodyvel_std=np.float32(vn_s))
+        if ne_m is not None:
+            local_kw.update(ne_mean=np.float32(ne_m), ne_std=np.float32(ne_s))
         np.savez(local, **local_kw)
         print(f"Wrote {local} (infer norm stats"
-              + (" + nbodyvel" if vn_m is not None else "") + ")")
+              + (" + nbodyvel" if vn_m is not None else "")
+              + (" + ne" if ne_m is not None else "") + ")")
     print(f"\nDone. cache -> {args.out}")
 
 

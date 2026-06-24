@@ -109,6 +109,14 @@ class FlowMatchingModel(pl.LightningModule):
         # cat([x_t, nbody, vel]) -> model.in_channels MUST be 3. Velocity is a STATIC
         # conditioning channel (NOT part of the x0/x1 flow). Default false = baseline.
         self.use_velocity = bool(d.get("use_velocity", False))
+        # Extra Mgas-paired OUTPUT (target) channel: electron density (ne). When true the
+        # loader yields ne (a 2nd target), the flow runs out_channels=2 = (Mgas, ne)
+        # jointly (x0 = nbody repeated to 2ch + noise, x1 = cat([mgas, ne])), and the
+        # latent encoder takes the stacked (Mgas, ne) -> in_channels=2. model.out_channels
+        # MUST be 2 and model.in_channels = out_channels + 1 [+1 vel]. Default false =
+        # single-channel Mgas baseline (fully backward compatible).
+        self.use_ne = bool(d.get("use_ne", False))
+        self.out_channels = m["out_channels"]
 
         # Variational (beta-VAE) latent: GasEncoder -> (mu, logvar), z reparametrised,
         # KL(q||N(0,I)) added to the recon loss. beta warms up linearly; per-dim
@@ -133,6 +141,7 @@ class FlowMatchingModel(pl.LightningModule):
             dropout=m.get("encoder_dropout", 0.1),
             circular_padding=m["circular_padding"],
             variational=self.variational,
+            in_channels=2 if self.use_ne else 1,   # encode (Mgas, ne) jointly when on
         )
         if t.get("gradient_checkpointing", False):
             self.net.enable_gradient_checkpointing()
@@ -234,25 +243,50 @@ class FlowMatchingModel(pl.LightningModule):
             return self.kl_beta
         return self.kl_beta * min(1.0, self.current_epoch / self.kl_warmup_epochs)
 
+    def _unpack(self, batch):
+        """Decode the dataloader tuple by the use_ne / use_velocity flags (NOT by
+        length): (nb, mg, [ne], cosmo, [vel]). Returns (nbody, mgas, ne, cosmo, vel)
+        with ne / vel None when their flag is off."""
+        nbody, mgas = batch[0], batch[1]
+        i = 2
+        ne = None
+        if self.use_ne:
+            ne = batch[i]; i += 1
+        cosmo = batch[i]; i += 1
+        vel = batch[i] if self.use_velocity else None
+        return nbody, mgas, ne, cosmo, vel
+
+    def _flow_targets(self, nbody, mgas, ne):
+        """Build the flow endpoints. Single channel: x1=mgas, x0=nbody. Multi-task:
+        x1=cat([mgas,ne]) and x0=nbody repeated to out_channels (each target channel
+        flows from the N-body density start, encoder3D-style)."""
+        if ne is None:
+            return nbody, mgas
+        x1 = torch.cat([mgas, ne], dim=1)                       # (B,2,...)
+        base = nbody.expand(-1, x1.size(1), -1, -1, -1)         # repeat nbody -> 2ch start
+        return base, x1
+
     def _step(self, batch, augment=False, sample_latent=False):
-        vel = None
-        if self.use_velocity:
-            nbody, mgas, cosmo, vel = batch
-        else:
-            nbody, mgas, cosmo = batch
+        nbody, mgas, ne, cosmo, vel = self._unpack(batch)
         if augment:
+            tensors = [nbody, mgas] + ([ne] if ne is not None else []) \
+                      + ([vel] if vel is not None else [])
+            tensors = list(self.aug(*tensors))                  # shared transform -> aligned
+            nbody, mgas = tensors[0], tensors[1]
+            j = 2
+            if ne is not None:
+                ne = tensors[j]; j += 1
             if vel is not None:
-                nbody, mgas, vel = self.aug(nbody, mgas, vel)   # shared transform -> aligned
-            else:
-                nbody, mgas = self.aug(nbody, mgas)
+                vel = tensors[j]
         B = nbody.size(0)
-        latent, kl = self._encode_latent(mgas, sample_latent)
+        enc_in = mgas if ne is None else torch.cat([mgas, ne], dim=1)
+        latent, kl = self._encode_latent(enc_in, sample_latent)
         if self.time_sampling == "logitnormal":
             t = torch.sigmoid(torch.randn(B, device=nbody.device))
         else:
             t = torch.rand(B, device=nbody.device)
-        x0 = (nbody + torch.randn_like(nbody) * self.noise_std) if self.noise_std > 0 else nbody
-        x1 = mgas
+        base, x1 = self._flow_targets(nbody, mgas, ne)
+        x0 = (base + torch.randn_like(base) * self.noise_std) if self.noise_std > 0 else base
         t_exp = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_exp) * x0 + t_exp * x1
         cond_in = [x_t, nbody] if vel is None else [x_t, nbody, vel]
@@ -276,7 +310,8 @@ class FlowMatchingModel(pl.LightningModule):
             self.log("kl", kl, prog_bar=True, on_step=False, on_epoch=True)
             self.log("kl_beta", beta, on_step=False, on_epoch=True)
         if self._aux_on():
-            aux = self._vel_aux_loss(pred, cosmo)
+            # critic judges the Mgas velocity channel (channel 0); ne channel ignored.
+            aux = self._vel_aux_loss(pred[:, :1], cosmo)
             w = self._vel_aux_w()
             loss = loss + w * aux
             self.log("vel_aux", aux, prog_bar=True, on_step=False, on_epoch=True)
@@ -381,7 +416,7 @@ class FlowMatchingModel(pl.LightningModule):
         B = buf.size(0)
         fwd = self.net.forward_offload if offload_skips else self.net
         def f(t, x):
-            buf[:, 0:1] = x
+            buf[:, :x.shape[1]] = x   # flow channels (1 = Mgas, or 2 = Mgas+ne)
             return fwd(buf, t.expand(B), cosmo, latent)
         return f
 
@@ -396,27 +431,27 @@ class FlowMatchingModel(pl.LightningModule):
     def _log_xcorr(self, batch):
         # Oracle latent: encode the TRUE Mgas (upper bound on FM transport given
         # the right latent). Inference without truth uses latent_mode in infer.py.
-        vel = None
-        if self.use_velocity:
-            nbody, mgas, cosmo, vel = batch
-        else:
-            nbody, mgas, cosmo = batch
+        nbody, mgas, ne, cosmo, vel = self._unpack(batch)
         nb32, cosmo32 = nbody.float(), cosmo.float()
         B, dev = nb32.size(0), nb32.device
-        # oracle latent = encode the TRUE Mgas; variational uses the mean (mu).
-        latent, _ = self._encode_latent(mgas.float(), sample_latent=False)
-        x0 = nb32 + torch.randn_like(nb32) * self.noise_std if self.noise_std > 0 else nb32.clone()
-        cw = 3 if vel is not None else 2   # flow(1) + nbody(1) [+ vel(1)] static channels
+        oc = self.out_channels
+        # oracle latent = encode the TRUE target ((Mgas) or (Mgas,ne)); variational -> mu.
+        enc_in = mgas.float() if ne is None else torch.cat([mgas.float(), ne.float()], dim=1)
+        latent, _ = self._encode_latent(enc_in, sample_latent=False)
+        base = nb32 if oc == 1 else nb32.expand(-1, oc, -1, -1, -1)
+        x0 = base + torch.randn_like(base) * self.noise_std if self.noise_std > 0 else base.clone()
+        cw = oc + (2 if vel is not None else 1)   # flow(oc) + nbody(1) [+ vel(1)]
         buf = torch.empty(B, cw, *nb32.shape[2:], device=dev, dtype=torch.float32)
-        buf[:, 1:2] = nb32
+        buf[:, oc:oc + 1] = nb32
         if vel is not None:
-            buf[:, 2:3] = vel.float()
+            buf[:, oc + 1:oc + 2] = vel.float()
         t_span = torch.linspace(0.0, 1.0, self.xcorr_steps + 1, device=dev)
         with torch.amp.autocast("cuda", enabled=False):
             x = odeint(self._ode_func(cosmo32, latent.float(), buf), x0, t_span,
                        method=self.xcorr_method,
                        **self._odeint_kwargs(self.xcorr_method, self.xcorr_steps,
                                              self.xcorr_rtol, self.xcorr_atol))[-1]
+        # acceptance metric is on the Mgas channel (channel 0)
         d1 = x[0, 0].cpu().numpy()
         d2 = mgas[0, 0].float().cpu().numpy()
         if (np.std(d1) < 1e-8 or np.std(d2) < 1e-8
@@ -444,12 +479,14 @@ class FlowMatchingModel(pl.LightningModule):
         offload_skips: CPU-offload skip connections (use for large 256^3 cubes)."""
         self.eval()
         B, dev = nbody.size(0), nbody.device
-        x0 = nbody + torch.randn_like(nbody) * self.noise_std if self.noise_std > 0 else nbody.clone()
-        cw = 3 if vel is not None else 2   # flow(1) + nbody(1) [+ vel(1)] static channels
+        oc = self.out_channels   # 1 = Mgas (returns (B,1,...)); 2 = (Mgas, ne)
+        base = nbody if oc == 1 else nbody.expand(-1, oc, -1, -1, -1)
+        x0 = base + torch.randn_like(base) * self.noise_std if self.noise_std > 0 else base.clone()
+        cw = oc + (2 if vel is not None else 1)   # flow(oc) + nbody(1) [+ vel(1)]
         buf = torch.empty(B, cw, *nbody.shape[2:], device=dev, dtype=nbody.dtype)
-        buf[:, 1:2] = nbody
+        buf[:, oc:oc + 1] = nbody
         if vel is not None:
-            buf[:, 2:3] = vel.to(buf.dtype)
+            buf[:, oc + 1:oc + 2] = vel.to(buf.dtype)
         ADAPTIVE = {'dopri5', 'dopri8', 'bosh3', 'fehlberg2', 'adaptive_heun'}
         t_span = (torch.tensor([0.0, 1.0], device=dev) if method in ADAPTIVE
                   else torch.linspace(0.0, 1.0, num_steps + 1, device=dev))

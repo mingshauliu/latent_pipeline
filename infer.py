@@ -37,6 +37,12 @@ def norm_field(v, mean, std):
     return (np.log1p(v) - mean) / std
 
 
+def norm_ne_field(v, mean, std):
+    """ne cache transform: log10 (floor 1e-12) + norm3d ne z-score. MUST match
+    prep_cache.normalise_ne (the encoder was trained on log10-normed ne)."""
+    return (np.log10(np.clip(v.astype(np.float32), 1e-12, None)) - mean) / std
+
+
 def norm_nbody(v, mean, std, div=1.0):
     """Scalar-corrected norm3d — MUST match the prep_cache norm_meta transform:
     'Astrid/(128/25)^3 then log1p+zscore(norm3d nbody)'. log1p of the MASS field
@@ -63,6 +69,11 @@ def norm_vel(v, mean, std):
 
 def denorm_field(x, mean, std):
     return np.expm1(x * std + mean)
+
+
+def denorm_ne(x, mean, std):
+    """Inverse of the ne cache transform (log10 + norm3d ne z-score) -> physical ne."""
+    return np.power(10.0, x * std + mean)
 
 
 def main():
@@ -104,6 +115,15 @@ def main():
             "run `python prep_cache.py --with_vel` first")
         print(f"velocity channel ON (norm3d nbodyVel {float(norm['nbodyvel_mean']):.3f}/"
               f"{float(norm['nbodyvel_std']):.3f}); sources need a vel_path")
+    # Multi-task output: model emits (Mgas, ne). ne is denormed with its own log1p
+    # stats and written to sample_ne_*.npy alongside the Mgas sample_*.npy.
+    use_ne = cfg["data"].get("use_ne", False)
+    if use_ne:
+        assert "ne_mean" in norm, (
+            "use_ne set but cached/norm_latent.npz lacks ne stats — "
+            "run `python prep_cache.py --with_ne` first")
+        print(f"ne OUTPUT channel ON (log1p {float(norm['ne_mean']):.3f}/"
+              f"{float(norm['ne_std']):.3f}); encode mode needs src.ne_path")
 
     gauss = None
     if mode == "gaussian":
@@ -131,6 +151,10 @@ def main():
             vel_arr = np.load(src["vel_path"], mmap_mode="r")
         cosmo_all = np.loadtxt(src["param_path"]).astype(np.float32)[:, :cfg["data"].get("n_cosmo", 2)]
         mgas_ref = np.load(src["mgas_path"], mmap_mode="r") if (mode == "encode" and src.get("mgas_path")) else None
+        # encode mode with the 2-ch (Mgas, ne) encoder needs a reference ne cube too.
+        ne_ref = np.load(src["ne_path"], mmap_mode="r") if (mode == "encode" and use_ne and src.get("ne_path")) else None
+        if mode == "encode" and use_ne:
+            assert ne_ref is not None, f"[{name}] encode + use_ne needs src.ne_path (Grids_ne)"
         n_take = src.get("n_samples") or len(nbody)
         out_dir = os.path.join(out_root, name)
         os.makedirs(out_dir, exist_ok=True)
@@ -171,8 +195,15 @@ def main():
                                     norm["mgas_mean"], norm["mgas_std"])
                     if clamp_val is not None:
                         np.clip(mg, -clamp_val, clamp_val, out=mg)
+                    enc_in = torch.from_numpy(mg)[None, None].to(dev)
+                    if use_ne:   # encoder expects stacked (Mgas, ne); ne uses log10 norm
+                        nev = norm_ne_field(np.asarray(ne_ref[i], dtype=np.float32),
+                                            norm["ne_mean"], norm["ne_std"])
+                        if clamp_val is not None:
+                            np.clip(nev, -clamp_val, clamp_val, out=nev)
+                        enc_in = torch.cat([enc_in, torch.from_numpy(nev)[None, None].to(dev)], dim=1)
                     with torch.no_grad():
-                        enc = model.gas_encoder(torch.from_numpy(mg)[None, None].to(dev))
+                        enc = model.gas_encoder(enc_in)
                     # variational encoder returns (mu, logvar) -> use the mean mu.
                     latent = enc[0] if isinstance(enc, tuple) else enc
                 else:
@@ -184,6 +215,11 @@ def main():
                 out = denorm_field(synth[0, 0].float().cpu().numpy(),
                                    norm["mgas_mean"], norm["mgas_std"])
                 np.save(out_path, out.astype(np.float32))
+                if use_ne:   # 2nd channel = ne (log10 denorm -> physical); sample_ne_*.npy
+                    ne_out = denorm_ne(synth[0, 1].float().cpu().numpy(),
+                                       norm["ne_mean"], norm["ne_std"])
+                    np.save(os.path.join(out_dir, f"sample_ne_{i:04d}{tag}.npy"),
+                            ne_out.astype(np.float32))
         print(f"  -> {out_dir}")
 
 

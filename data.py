@@ -240,16 +240,44 @@ def load_velocity_arrs(d):
     return vel_arrs
 
 
+def load_ne_arrs(d):
+    """Per-suite electron-density (ne) channel from the FM cache — a 2nd OUTPUT (target)
+    field for the multi-task (Mgas + ne) variant.
+
+    `Ne_norm_{suite}_LH_128_z=0.0.npy` — voxelised ne, log1p + FRESH pool z-score
+    (prep_cache.py --with_ne; NOT the norm3d log10 stat). Returns per-suite mmaps aligned
+    with load_cache_pool's suite order, so ne_arrs[si][li] matches mgas_arrs[si][li].
+    Raises if the cache is missing (voxelise_clean/scripts/voxelize_ne.py --stack then
+    `python prep_cache.py --with_ne`)."""
+    cache = d["cache_dir"]
+    ne_arrs = []
+    for suite in d["suites"]:
+        p = os.path.join(cache, f"Ne_norm_{suite}_LH_128_z=0.0.npy")
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"ne cache missing: {p}. Voxelise (voxelise_clean/scripts/voxelize_ne.py "
+                f"--stack) then `python prep_cache.py --with_ne`.")
+        ne = np.load(p, mmap_mode="r")
+        ne_arrs.append(ne)
+        print(f"  [cache {suite}] ne(norm) {ne.shape}")
+    return ne_arrs
+
+
 class CachedFMDataset(Dataset):
     """Pre-normed Nbody -> pre-normed Mgas + pre-normed cosmo (all cached). PBC roll aug.
 
-    If `vel_arrs` is given (N-body velocity channel, load_velocity_arrs), __getitem__
-    returns a 4th element `vel` (1,D,D,D) — the velocity conditioning channel, clamped
-    and augmented with the SAME shifts/crop as nbody/mgas so all fields stay aligned.
-    Default (vel_arrs=None) returns the legacy (nb, mg, cosmo) 3-tuple unchanged."""
+    Optional extra channels, each clamped + augmented with the SAME shifts/crop as
+    nbody/mgas (alignment kept). The returned tuple is ordered
+    (nb, mg, [ne], cosmo, [vel]) — ne (2nd OUTPUT/target) inserted before cosmo, vel
+    (conditioning input) appended after, matching how module.FlowMatchingModel unpacks
+    by the use_ne / use_velocity flags (NOT by tuple length):
+      - `ne_arrs`  (load_ne_arrs)        -> 4th-from-... ne element (1,D,D,D) TARGET.
+      - `vel_arrs` (load_velocity_arrs)  -> trailing vel element (1,D,D,D) CONDITIONING.
+    Default (both None) returns the legacy (nb, mg, cosmo) 3-tuple unchanged."""
 
     def __init__(self, nbody_arrs, mgas_arrs, cosmo_all, flat, indices,
-                 crop_size=None, augment=True, clamp_val=10.0, vel_arrs=None):
+                 crop_size=None, augment=True, clamp_val=10.0, vel_arrs=None,
+                 ne_arrs=None):
         self.nbody_arrs = nbody_arrs
         self.mgas_arrs = mgas_arrs
         self.cosmo_all = cosmo_all
@@ -258,6 +286,7 @@ class CachedFMDataset(Dataset):
         self.crop_size = crop_size
         self.augment = augment
         self.vel_arrs = vel_arrs
+        self.ne_arrs = ne_arrs
         # Clamp the heavy-tailed Nbody overdensity z-score (max ~+21 = 45 sigma at
         # DM halo cores) to +/- clamp_val. Caps the rare outlier voxels that drive
         # per-batch MSE to ~1e4 and blow up the converged FM (see CLAUDE.md). Mgas
@@ -272,9 +301,12 @@ class CachedFMDataset(Dataset):
         si, li = self.flat[g]
         nb = np.array(self.nbody_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
         mg = np.array(self.mgas_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
+        # field order: nb, mg, [ne], [vel] — all clamped + augmented together (aligned).
         fields = [nb, mg]
+        if self.ne_arrs is not None:
+            fields.append(np.array(self.ne_arrs[si][li], dtype=np.float32))   # ne TARGET
         if self.vel_arrs is not None:
-            fields.append(np.array(self.vel_arrs[si][li], dtype=np.float32))  # velocity channel
+            fields.append(np.array(self.vel_arrs[si][li], dtype=np.float32))  # velocity COND
         if self.clamp_val is not None:
             c = float(self.clamp_val)
             for f in fields:
@@ -291,9 +323,15 @@ class CachedFMDataset(Dataset):
             shifts = (random.randint(0, D - 1), random.randint(0, D - 1), random.randint(0, D - 1))
             fields = [torch.roll(f, shifts, dims=(0, 1, 2)) for f in fields]
         cosmo = torch.from_numpy(self.cosmo_all[g].astype(np.float32))
-        out = [fields[0].unsqueeze(0), fields[1].unsqueeze(0), cosmo]
+        # emit (nb, mg, [ne], cosmo, [vel]) — ne before cosmo, vel after (matches
+        # module._unpack, which keys off the use_ne/use_velocity flags).
+        fi = 2
+        out = [fields[0].unsqueeze(0), fields[1].unsqueeze(0)]
+        if self.ne_arrs is not None:
+            out.append(fields[fi].unsqueeze(0)); fi += 1   # ne (1,D,D,D)
+        out.append(cosmo)
         if self.vel_arrs is not None:
-            out.append(fields[2].unsqueeze(0))   # vel (1,D,D,D)
+            out.append(fields[fi].unsqueeze(0))            # vel (1,D,D,D)
         return tuple(out)
 
 

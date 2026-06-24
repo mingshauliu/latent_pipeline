@@ -15,7 +15,7 @@ import yaml
 
 from data import (load_suite_pool, compute_field_stats, compute_cosmo_stats,
                   MultiSuiteFMDataset, load_cache_pool, CachedFMDataset,
-                  load_velocity_arrs)
+                  load_velocity_arrs, load_ne_arrs)
 from module import FlowMatchingModel
 
 NORM_PATH = "cached/norm_latent.npz"
@@ -45,27 +45,50 @@ def build_norm(d, nbody_arrs, mgas_arrs, cosmo_all, flat):
 
 @torch.no_grad()
 def warm_load_partial(model, src_sd):
-    """Load a source state_dict into a model whose latent head / FiLM-fusion layers
-    changed shape (latent_dim and/or variational mu,logvar head differ). Copies all
-    shape-matching tensors, then smart-inits the two reshaped layers from source
-    slices: gas_encoder.proj <- source rows into the new mu rows; net.cond_fuse.0 <-
-    source time(64)+cosmo(64) input columns (latent columns stay freshly initialised).
-    EMA shadow is intentionally NOT loaded — it rebuilds from current weights."""
+    """Load a source state_dict into a model whose latent head / FiLM-fusion / channel
+    counts changed shape. Copies all shape-matching tensors, then smart-inits the
+    reshaped layers from source slices:
+      - gas_encoder.proj <- source rows into the new mu rows (latent_dim / variational).
+      - net.cond_fuse.0  <- source time(64)+cosmo(64) input cols (latent cols fresh).
+      - input-channel expansion (UNet in_channels grows: +velocity, +ne x_t channels).
+      - output-channel expansion (out_conv 1->2 when adding the ne target: copy the Mgas
+        out row, leave the ne row at its zero-init).
+    The first UNet conv (net.enc1.conv1/skip) input layout is [x_t(out_ch), nbody, vel?];
+    when out_channels grows (Mgas->Mgas+ne) the static nbody/vel cols SHIFT, so they are
+    remapped by role rather than naively column-copied. EMA shadow is NOT loaded."""
     own = model.state_dict()
+    src_oc = int(src_sd["net.out_conv.weight"].shape[0]) if "net.out_conv.weight" in src_sd else 1
+    dst_oc = int(model.out_channels)
+    enc1_in = {"net.enc1.conv1.weight", "net.enc1.skip.weight"}
     copied, skipped, chan = [], [], []
     for k, v in src_sd.items():
         if k in own and own[k].shape == v.shape:
             own[k].copy_(v)
             copied.append(k)
+        elif (k in enc1_in and k in own and dst_oc != src_oc
+              and own[k].shape[1] > v.shape[1] and own[k].shape[0] == v.shape[0]
+              and own[k].shape[2:] == v.shape[2:]):
+            # first conv: input layout [x_t(oc), nbody, vel?]. Remap by ROLE so the
+            # static nbody/vel cols land in their shifted positions (extra x_t cols
+            # for the new ne channel stay fresh).
+            own[k][:, :src_oc].copy_(v[:, :src_oc])                 # x_t (Mgas) cols
+            own[k][:, dst_oc:dst_oc + (v.shape[1] - src_oc)].copy_(v[:, src_oc:])  # nbody[+vel]
+            chan.append((k + " (role-remap)", tuple(v.shape), tuple(own[k].shape)))
         elif (k in own and v.dim() == own[k].dim() and v.dim() >= 2
               and own[k].shape[0] == v.shape[0] and own[k].shape[2:] == v.shape[2:]
               and own[k].shape[1] > v.shape[1]):
-            # input-channel expansion (e.g. UNet in_channels 2->3 when adding the
-            # velocity channel): copy the existing [x_t, nbody] input cols, leave the
-            # new vel col freshly initialised. Hits net.enc1.conv1 + net.enc1.skip.
+            # input-channel expansion (e.g. UNet in_channels 2->3 for velocity): copy the
+            # existing input cols, leave the new col(s) fresh. Encoder stem 1->2 (ne) too.
             c = v.shape[1]
             own[k][:, :c].copy_(v)
             chan.append((k, tuple(v.shape), tuple(own[k].shape)))
+        elif (k in own and v.dim() == own[k].dim() and v.dim() >= 1
+              and own[k].shape[0] > v.shape[0] and own[k].shape[1:] == v.shape[1:]):
+            # output-channel expansion (out_conv 1->2 for the ne target): copy the Mgas
+            # out row(s); the ne row keeps its zero-init (designed v=0 start).
+            r = v.shape[0]
+            own[k][:r].copy_(v)
+            chan.append((k + " (out-expand)", tuple(v.shape), tuple(own[k].shape)))
         else:
             skipped.append((k, tuple(v.shape), tuple(own[k].shape) if k in own else None))
 
@@ -123,19 +146,25 @@ def main():
 
     use_cache = d.get("use_cache", False)
     use_velocity = d.get("use_velocity", False)
+    use_ne = d.get("use_ne", False)
     if use_cache:
         print("Loading pre-normalised cache pool:")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_cache_pool(d)
         clamp_val = d.get("clamp_val", 10.0)
         vel_arrs = load_velocity_arrs(d) if use_velocity else None
+        ne_arrs = load_ne_arrs(d) if use_ne else None
         if use_velocity:
-            print(f"  + velocity channel ({len(vel_arrs)} suites) -> in_channels must be 3")
+            print(f"  + velocity channel ({len(vel_arrs)} suites) -> in_channels +1")
+        if use_ne:
+            print(f"  + ne TARGET channel ({len(ne_arrs)} suites) -> out_channels=2, "
+                  f"in_channels = out_channels+1[+vel]")
         ds_cls = lambda ix, aug: CachedFMDataset(  # noqa: E731
             nbody_arrs, mgas_arrs, cosmo_all, flat, ix,
-            crop_size=crop, augment=aug, clamp_val=clamp_val, vel_arrs=vel_arrs)
+            crop_size=crop, augment=aug, clamp_val=clamp_val,
+            vel_arrs=vel_arrs, ne_arrs=ne_arrs)
     else:
-        if use_velocity:
-            raise ValueError("use_velocity requires use_cache=true (velocity cache path)")
+        if use_velocity or use_ne:
+            raise ValueError("use_velocity/use_ne require use_cache=true (cache paths)")
         print("Loading multi-suite pool (lazy norm):")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_suite_pool(d)
         norm = build_norm(d, nbody_arrs, mgas_arrs, cosmo_all, flat)

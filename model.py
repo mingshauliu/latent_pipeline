@@ -279,13 +279,17 @@ class GasEncoder(nn.Module):
         (N(0,I)) valid by construction (prior == latent dist)."""
 
     def __init__(self, latent_dim=8, base=16, dropout=0.1,
-                 circular_padding=True, use_checkpoint=True, variational=False):
+                 circular_padding=True, use_checkpoint=True, variational=False,
+                 in_channels=1):
         super().__init__()
         pad = "circular" if circular_padding else "constant"
         self.pad_mode = pad
         self.use_checkpoint = use_checkpoint
         self.variational = variational
-        self.stem = nn.Conv3d(1, base, 3, bias=False)
+        # in_channels=1 -> encode Mgas only (baseline). in_channels=2 -> encode the
+        # stacked (Mgas, ne) target (multi-task variant); richer encode signal, may
+        # resist latent collapse. The caller cats the fields before calling forward.
+        self.stem = nn.Conv3d(in_channels, base, 3, bias=False)
         self.enc1 = _EncBlock(base, 2*base, dropout, pad)
         self.enc2 = _EncBlock(2*base, 4*base, dropout, pad)
         self.enc3 = _EncBlock(4*base, 8*base, dropout, pad)
