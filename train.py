@@ -15,7 +15,7 @@ import yaml
 
 from data import (load_suite_pool, compute_field_stats, compute_cosmo_stats,
                   MultiSuiteFMDataset, load_cache_pool, CachedFMDataset,
-                  load_velocity_arrs, load_ne_arrs)
+                  load_velocity_arrs, load_target_arrs)
 from module import FlowMatchingModel
 
 NORM_PATH = "cached/norm_latent.npz"
@@ -146,25 +146,28 @@ def main():
 
     use_cache = d.get("use_cache", False)
     use_velocity = d.get("use_velocity", False)
-    use_ne = d.get("use_ne", False)
+    # ordered extra-OUTPUT targets; back-compat: use_ne -> [ne]. e.g. [ne, T].
+    target_fields = d.get("target_fields")
+    if target_fields is None:
+        target_fields = ["ne"] if d.get("use_ne", False) else []
     if use_cache:
         print("Loading pre-normalised cache pool:")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_cache_pool(d)
         clamp_val = d.get("clamp_val", 10.0)
         vel_arrs = load_velocity_arrs(d) if use_velocity else None
-        ne_arrs = load_ne_arrs(d) if use_ne else None
+        target_arrs = [load_target_arrs(d, f) for f in target_fields]
         if use_velocity:
             print(f"  + velocity channel ({len(vel_arrs)} suites) -> in_channels +1")
-        if use_ne:
-            print(f"  + ne TARGET channel ({len(ne_arrs)} suites) -> out_channels=2, "
-                  f"in_channels = out_channels+1[+vel]")
+        if target_fields:
+            print(f"  + extra TARGET channels {target_fields} -> "
+                  f"out_channels={1+len(target_fields)}, in_channels=out_channels+1[+vel]")
         ds_cls = lambda ix, aug: CachedFMDataset(  # noqa: E731
             nbody_arrs, mgas_arrs, cosmo_all, flat, ix,
             crop_size=crop, augment=aug, clamp_val=clamp_val,
-            vel_arrs=vel_arrs, ne_arrs=ne_arrs)
+            vel_arrs=vel_arrs, target_arrs=target_arrs)
     else:
-        if use_velocity or use_ne:
-            raise ValueError("use_velocity/use_ne require use_cache=true (cache paths)")
+        if use_velocity or target_fields:
+            raise ValueError("use_velocity/target_fields require use_cache=true (cache paths)")
         print("Loading multi-suite pool (lazy norm):")
         nbody_arrs, mgas_arrs, cosmo_all, flat = load_suite_pool(d)
         norm = build_norm(d, nbody_arrs, mgas_arrs, cosmo_all, flat)

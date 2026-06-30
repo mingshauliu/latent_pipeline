@@ -76,6 +76,17 @@ def denorm_ne(x, mean, std):
     return np.power(10.0, x * std + mean)
 
 
+# extra-OUTPUT target registry: encode-norm (forward), denorm (write), stat keys in
+# norm_latent.npz, per-source reference-cube path key, output filename prefix.
+#   ne -> log10 (norm_ne_field / denorm_ne);  T -> log1p (norm_field / denorm_field).
+TARGET_SPEC = {
+    "ne": dict(norm=norm_ne_field, denorm=denorm_ne, mkey="ne_mean", skey="ne_std",
+               path="ne_path", out="sample_ne"),
+    "T":  dict(norm=norm_field,    denorm=denorm_field, mkey="t_mean", skey="t_std",
+               path="t_path", out="sample_T"),
+}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
@@ -115,15 +126,19 @@ def main():
             "run `python prep_cache.py --with_vel` first")
         print(f"velocity channel ON (norm3d nbodyVel {float(norm['nbodyvel_mean']):.3f}/"
               f"{float(norm['nbodyvel_std']):.3f}); sources need a vel_path")
-    # Multi-task output: model emits (Mgas, ne). ne is denormed with its own log1p
-    # stats and written to sample_ne_*.npy alongside the Mgas sample_*.npy.
-    use_ne = cfg["data"].get("use_ne", False)
-    if use_ne:
-        assert "ne_mean" in norm, (
-            "use_ne set but cached/norm_latent.npz lacks ne stats — "
-            "run `python prep_cache.py --with_ne` first")
-        print(f"ne OUTPUT channel ON (log1p {float(norm['ne_mean']):.3f}/"
-              f"{float(norm['ne_std']):.3f}); encode mode needs src.ne_path")
+    # Multi-task output: model emits (Mgas, *extras). Each extra is denormed with its
+    # own stats and written to sample_{field}_*.npy alongside the Mgas sample_*.npy.
+    # Back-compat: use_ne -> target_fields [ne].
+    target_fields = cfg["data"].get("target_fields")
+    if target_fields is None:
+        target_fields = ["ne"] if cfg["data"].get("use_ne", False) else []
+    for f in target_fields:
+        spec = TARGET_SPEC[f]
+        assert spec["mkey"] in norm, (
+            f"target '{f}' set but cached/norm_latent.npz lacks its stats — "
+            f"run `python prep_cache.py --with_{'ne' if f == 'ne' else 'temp'}` first")
+        print(f"{f} OUTPUT channel ON ({float(norm[spec['mkey']]):.3f}/"
+              f"{float(norm[spec['skey']]):.3f}); encode mode needs src.{spec['path']}")
 
     gauss = None
     if mode == "gaussian":
@@ -151,10 +166,13 @@ def main():
             vel_arr = np.load(src["vel_path"], mmap_mode="r")
         cosmo_all = np.loadtxt(src["param_path"]).astype(np.float32)[:, :cfg["data"].get("n_cosmo", 2)]
         mgas_ref = np.load(src["mgas_path"], mmap_mode="r") if (mode == "encode" and src.get("mgas_path")) else None
-        # encode mode with the 2-ch (Mgas, ne) encoder needs a reference ne cube too.
-        ne_ref = np.load(src["ne_path"], mmap_mode="r") if (mode == "encode" and use_ne and src.get("ne_path")) else None
-        if mode == "encode" and use_ne:
-            assert ne_ref is not None, f"[{name}] encode + use_ne needs src.ne_path (Grids_ne)"
+        # encode mode with the (Mgas, *extras) encoder needs a reference cube per target.
+        target_refs = []
+        if mode == "encode":
+            for f in target_fields:
+                pk = TARGET_SPEC[f]["path"]
+                assert src.get(pk), f"[{name}] encode + target '{f}' needs src.{pk}"
+                target_refs.append(np.load(src[pk], mmap_mode="r"))
         n_take = src.get("n_samples") or len(nbody)
         out_dir = os.path.join(out_root, name)
         os.makedirs(out_dir, exist_ok=True)
@@ -196,12 +214,14 @@ def main():
                     if clamp_val is not None:
                         np.clip(mg, -clamp_val, clamp_val, out=mg)
                     enc_in = torch.from_numpy(mg)[None, None].to(dev)
-                    if use_ne:   # encoder expects stacked (Mgas, ne); ne uses log10 norm
-                        nev = norm_ne_field(np.asarray(ne_ref[i], dtype=np.float32),
-                                            norm["ne_mean"], norm["ne_std"])
+                    # encoder expects stacked (Mgas, *extras), each with its own norm.
+                    for f, ref in zip(target_fields, target_refs):
+                        spec = TARGET_SPEC[f]
+                        tv = spec["norm"](np.asarray(ref[i], dtype=np.float32),
+                                          norm[spec["mkey"]], norm[spec["skey"]])
                         if clamp_val is not None:
-                            np.clip(nev, -clamp_val, clamp_val, out=nev)
-                        enc_in = torch.cat([enc_in, torch.from_numpy(nev)[None, None].to(dev)], dim=1)
+                            np.clip(tv, -clamp_val, clamp_val, out=tv)
+                        enc_in = torch.cat([enc_in, torch.from_numpy(tv)[None, None].to(dev)], dim=1)
                     with torch.no_grad():
                         enc = model.gas_encoder(enc_in)
                     # variational encoder returns (mu, logvar) -> use the mean mu.
@@ -215,11 +235,13 @@ def main():
                 out = denorm_field(synth[0, 0].float().cpu().numpy(),
                                    norm["mgas_mean"], norm["mgas_std"])
                 np.save(out_path, out.astype(np.float32))
-                if use_ne:   # 2nd channel = ne (log10 denorm -> physical); sample_ne_*.npy
-                    ne_out = denorm_ne(synth[0, 1].float().cpu().numpy(),
-                                       norm["ne_mean"], norm["ne_std"])
-                    np.save(os.path.join(out_dir, f"sample_ne_{i:04d}{tag}.npy"),
-                            ne_out.astype(np.float32))
+                # extra channels: synth[0, 1+j] -> denorm per field -> sample_{field}_*.npy
+                for j, f in enumerate(target_fields):
+                    spec = TARGET_SPEC[f]
+                    t_out = spec["denorm"](synth[0, 1 + j].float().cpu().numpy(),
+                                           norm[spec["mkey"]], norm[spec["skey"]])
+                    np.save(os.path.join(out_dir, f"{spec['out']}_{i:04d}{tag}.npy"),
+                            t_out.astype(np.float32))
         print(f"  -> {out_dir}")
 
 

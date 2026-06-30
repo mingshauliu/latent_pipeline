@@ -193,8 +193,9 @@ def compute_cosmo_stats(cosmo_all):
 def load_cache_pool(d):
     """Load the fully pre-normalised FM cache (Nbody + Mgas + cosmo) from `cache_dir`.
 
-    Nbody: `Nbody_norm_{suite}_LH_128_z=0.0.npy` — overdensity log1p(1+delta) + global
-           z-score (suite-invariant; particle-mass units removed — see CLAUDE.md).
+    Nbody: `Nbody_norm_{suite}_LH_128_z=0.0.npy` — log1p(Mtot/suite_div) + norm3d
+           'nbody' z-score (Astrid suite_div=(128/25)^3 is a CONSTANT unit fix, NOT
+           overdensity; NO per-cube mean division anywhere — see CLAUDE.md).
     Mgas : `Mgas_norm_{suite}_LH_128_z=0.0.npy` — log1p + norm3d gas z-score.
     cosmo: `cosmo_{suite}.npy` — (Omega_m, sigma_8) z-scored with norm3d param[:2].
 
@@ -240,27 +241,33 @@ def load_velocity_arrs(d):
     return vel_arrs
 
 
-def load_ne_arrs(d):
-    """Per-suite electron-density (ne) channel from the FM cache — a 2nd OUTPUT (target)
-    field for the multi-task (Mgas + ne) variant.
+# extra-target field name -> cached-array filename prefix (all log1p/log10 + z-score,
+# NO overdensity). Mgas is always channel 0 and not listed here.
+TARGET_CACHE_PREFIX = {"ne": "Ne_norm", "T": "T_norm"}
 
-    `Ne_norm_{suite}_LH_128_z=0.0.npy` — voxelised ne, log1p + FRESH pool z-score
-    (prep_cache.py --with_ne; NOT the norm3d log10 stat). Returns per-suite mmaps aligned
-    with load_cache_pool's suite order, so ne_arrs[si][li] matches mgas_arrs[si][li].
-    Raises if the cache is missing (voxelise_clean/scripts/voxelize_ne.py --stack then
-    `python prep_cache.py --with_ne`)."""
+
+def load_target_arrs(d, field):
+    """Per-suite extra-OUTPUT (target) channel `field` from the FM cache, aligned with
+    load_cache_pool's suite order so arr[si][li] matches mgas_arrs[si][li]. Built by
+    `python prep_cache.py --with_{ne|temp}` (raw -> log10(ne)/log1p(T) -> z-score)."""
+    prefix = TARGET_CACHE_PREFIX[field]
     cache = d["cache_dir"]
-    ne_arrs = []
+    arrs = []
     for suite in d["suites"]:
-        p = os.path.join(cache, f"Ne_norm_{suite}_LH_128_z=0.0.npy")
+        p = os.path.join(cache, f"{prefix}_{suite}_LH_128_z=0.0.npy")
         if not os.path.exists(p):
             raise FileNotFoundError(
-                f"ne cache missing: {p}. Voxelise (voxelise_clean/scripts/voxelize_ne.py "
-                f"--stack) then `python prep_cache.py --with_ne`.")
-        ne = np.load(p, mmap_mode="r")
-        ne_arrs.append(ne)
-        print(f"  [cache {suite}] ne(norm) {ne.shape}")
-    return ne_arrs
+                f"{field} target cache missing: {p}. Run `python prep_cache.py "
+                f"--with_{'ne' if field == 'ne' else 'temp'}`.")
+        a = np.load(p, mmap_mode="r")
+        arrs.append(a)
+        print(f"  [cache {suite}] {field}(norm) {a.shape}")
+    return arrs
+
+
+def load_ne_arrs(d):
+    """Back-compat shim: the ne target via the generic loader."""
+    return load_target_arrs(d, "ne")
 
 
 class CachedFMDataset(Dataset):
@@ -268,16 +275,17 @@ class CachedFMDataset(Dataset):
 
     Optional extra channels, each clamped + augmented with the SAME shifts/crop as
     nbody/mgas (alignment kept). The returned tuple is ordered
-    (nb, mg, [ne], cosmo, [vel]) — ne (2nd OUTPUT/target) inserted before cosmo, vel
-    (conditioning input) appended after, matching how module.FlowMatchingModel unpacks
-    by the use_ne / use_velocity flags (NOT by tuple length):
-      - `ne_arrs`  (load_ne_arrs)        -> 4th-from-... ne element (1,D,D,D) TARGET.
-      - `vel_arrs` (load_velocity_arrs)  -> trailing vel element (1,D,D,D) CONDITIONING.
-    Default (both None) returns the legacy (nb, mg, cosmo) 3-tuple unchanged."""
+    (nb, mg, *targets, cosmo, [vel]) — extra OUTPUT/targets (ne, T, …) inserted before
+    cosmo in `target_arrs` order, vel (conditioning input) appended after, matching how
+    module.FlowMatchingModel unpacks by n_extra_targets / use_velocity (NOT tuple length):
+      - `target_arrs` (list of load_target_arrs) -> ordered extra TARGET elements (1,D,D,D).
+      - `vel_arrs`    (load_velocity_arrs)        -> trailing vel element (1,D,D,D) COND.
+    Default (both None) returns the legacy (nb, mg, cosmo) 3-tuple unchanged. Legacy
+    `ne_arrs=` is still accepted (== target_arrs=[ne_arrs])."""
 
     def __init__(self, nbody_arrs, mgas_arrs, cosmo_all, flat, indices,
                  crop_size=None, augment=True, clamp_val=10.0, vel_arrs=None,
-                 ne_arrs=None):
+                 ne_arrs=None, target_arrs=None):
         self.nbody_arrs = nbody_arrs
         self.mgas_arrs = mgas_arrs
         self.cosmo_all = cosmo_all
@@ -286,8 +294,11 @@ class CachedFMDataset(Dataset):
         self.crop_size = crop_size
         self.augment = augment
         self.vel_arrs = vel_arrs
-        self.ne_arrs = ne_arrs
-        # Clamp the heavy-tailed Nbody overdensity z-score (max ~+21 = 45 sigma at
+        # ordered list of extra-target per-suite arrays; legacy ne_arrs -> single-element.
+        if target_arrs is None and ne_arrs is not None:
+            target_arrs = [ne_arrs]
+        self.target_arrs = target_arrs or []
+        # Clamp the heavy-tailed Nbody log1p-field z-score (max ~+21 = 45 sigma at
         # DM halo cores) to +/- clamp_val. Caps the rare outlier voxels that drive
         # per-batch MSE to ~1e4 and blow up the converged FM (see CLAUDE.md). Mgas
         # range is ~+/-9 so clamp_val=10 leaves it untouched. None disables.
@@ -301,10 +312,10 @@ class CachedFMDataset(Dataset):
         si, li = self.flat[g]
         nb = np.array(self.nbody_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
         mg = np.array(self.mgas_arrs[si][li], dtype=np.float32)   # already normalised; copy (mmap is read-only)
-        # field order: nb, mg, [ne], [vel] — all clamped + augmented together (aligned).
+        # field order: nb, mg, *targets, [vel] — all clamped + augmented together (aligned).
         fields = [nb, mg]
-        if self.ne_arrs is not None:
-            fields.append(np.array(self.ne_arrs[si][li], dtype=np.float32))   # ne TARGET
+        for ta in self.target_arrs:
+            fields.append(np.array(ta[si][li], dtype=np.float32))             # extra TARGET
         if self.vel_arrs is not None:
             fields.append(np.array(self.vel_arrs[si][li], dtype=np.float32))  # velocity COND
         if self.clamp_val is not None:
@@ -323,12 +334,13 @@ class CachedFMDataset(Dataset):
             shifts = (random.randint(0, D - 1), random.randint(0, D - 1), random.randint(0, D - 1))
             fields = [torch.roll(f, shifts, dims=(0, 1, 2)) for f in fields]
         cosmo = torch.from_numpy(self.cosmo_all[g].astype(np.float32))
-        # emit (nb, mg, [ne], cosmo, [vel]) — ne before cosmo, vel after (matches
-        # module._unpack, which keys off the use_ne/use_velocity flags).
+        # emit (nb, mg, *targets, cosmo, [vel]) — targets before cosmo, vel after
+        # (matches module._unpack, which keys off n_extra_targets/use_velocity).
+        n_t = len(self.target_arrs)
         fi = 2
         out = [fields[0].unsqueeze(0), fields[1].unsqueeze(0)]
-        if self.ne_arrs is not None:
-            out.append(fields[fi].unsqueeze(0)); fi += 1   # ne (1,D,D,D)
+        for _ in range(n_t):
+            out.append(fields[fi].unsqueeze(0)); fi += 1   # extra target (1,D,D,D)
         out.append(cosmo)
         if self.vel_arrs is not None:
             out.append(fields[fi].unsqueeze(0))            # vel (1,D,D,D)

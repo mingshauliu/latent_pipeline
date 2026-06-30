@@ -35,6 +35,13 @@ NBODYVEL_TMPL = "/mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_{sui
 # which is degenerate at that scale) + shared norm3d 'ne' z-score (mean -6.96/std 0.57;
 # pool log10 mean -6.94/std 0.56 matches; zscored peak ~8.8 < clamp 10).
 NE_TMPL = "/mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_ne_{suite}_LH_128_z=0.0.npy"
+# Temperature — also public in the CMD release (NO voxelisation). Extra FM OUTPUT
+# (target) channel for the full multi-task [Mgas, ne, T] (encoder3D parity). Raw T is
+# Kelvin (1e3-1e7) -> norm = LOG1P + z-score. The norm3d 'T' stat (10.08/3.12) is a
+# DIFFERENT field (mass-weighted) -> using it leaves pool mean -0.16/std 0.90, so we
+# compute a FRESH pool stat over the public Grids_T (pool log1p ~9.57/2.80). NO suite
+# div (T intensive), NO overdensity.
+T_TMPL = "/mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_T_{suite}_LH_128_z=0.0.npy"
 PARAM_TMPL = "/mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt"
 NORM3D = "/mnt/home/mliu1/ceph/norm3d.npy"
 OUT_DIR = "/mnt/ceph/users/mliu1/latent_pipeline_cache/L25_LH_128_norm"
@@ -121,6 +128,48 @@ def normalise_ne(raw, mean, std):
     return ((np.log10(v) - np.float32(mean)) / np.float32(std)).astype(np.float32)
 
 
+# ── temperature (T) — FM 3rd output channel ─────────────────────────────────────
+def normalise_temp(raw, mean, std):
+    """log1p then z-score with the FRESH pool T stat. float32 out."""
+    return ((np.log1p(raw.astype(np.float32)) - np.float32(mean)) / np.float32(std)).astype(np.float32)
+
+
+def compute_temp_stat(suites, every=200):
+    """Fresh pool log1p mean/std over the public Grids_T (norm3d T is a mismatched
+    field). Subsamples cubes per suite for speed; stats are stable."""
+    ms, vs = [], []
+    for s in suites:
+        a = np.load(T_TMPL.format(suite=s), mmap_mode="r")
+        for i in range(0, len(a), every):
+            l = np.log1p(np.asarray(a[i], dtype=np.float32))
+            ms.append(float(l.mean())); vs.append(float(l.var()))
+    m = float(np.mean(ms))
+    sd = float(np.sqrt(np.mean(vs) + np.var(ms)))
+    print(f"fresh pool T (log1p) mean/std = {m:.4f}/{sd:.4f} (no suite div; norm3d T NOT used)")
+    return m, sd
+
+
+def process_suite_temp(suite, t_m, t_s, out_dir, log_every=100):
+    t_in = np.load(T_TMPL.format(suite=suite), mmap_mode="r")
+    n = len(t_in)
+    out_path = os.path.join(out_dir, f"T_norm_{suite}_LH_128_z=0.0.npy")
+    t_out = open_memmap(out_path, mode="w+", dtype=np.float32, shape=(n, GRID, GRID, GRID))
+    print(f"\n[{suite}] {n} T cubes (log1p+fresh pool z-score) -> {os.path.basename(out_path)}")
+    s = q = 0.0
+    amax = 0.0
+    for i in range(n):
+        tn = normalise_temp(np.asarray(t_in[i]), t_m, t_s)
+        t_out[i] = tn
+        s += float(tn.mean()); q += float((tn ** 2).mean())
+        amax = max(amax, float(np.abs(tn).max()))
+        if (i + 1) % log_every == 0:
+            print(f"  {suite} T {i+1}/{n}", flush=True)
+    t_out.flush(); del t_out
+    mean, std = s / n, (q / n - (s / n) ** 2) ** 0.5
+    print(f"  [{suite}] T_norm pool mean~{mean:+.3f} std~{std:.3f} max|val|~{amax:.2f} "
+          f"| wrote {out_path}")
+
+
 def process_suite_ne(suite, ne_m, ne_s, out_dir, log_every=100):
     ne_in = np.load(NE_TMPL.format(suite=suite), mmap_mode="r")
     n = len(ne_in)
@@ -176,7 +225,8 @@ def main():
     ap.add_argument("--suites", nargs="+", default=["IllustrisTNG", "Astrid", "SIMBA"])
     ap.add_argument("--out", default=OUT_DIR)
     ap.add_argument("--log_every", type=int, default=100)
-    ap.add_argument("--no_nbody", action="store_true", help="skip Nbody overdensity cache")
+    ap.add_argument("--no_nbody", action="store_true",
+                    help="skip Nbody cache (log1p+norm3d z-score; not overdensity)")
     ap.add_argument("--no_mgas", action="store_true", help="skip Mgas cache (Nbody only)")
     ap.add_argument("--with_vel", action="store_true",
                     help="ALSO cache the N-body velocity channel (requires voxelise/"
@@ -184,6 +234,9 @@ def main():
     ap.add_argument("--with_ne", action="store_true",
                     help="ALSO cache the electron-density (ne) target channel from the "
                          "public CMD Grids_ne (no voxelise). log10 + norm3d 'ne' z-score.")
+    ap.add_argument("--with_temp", action="store_true",
+                    help="ALSO cache the temperature (T) target channel from the public "
+                         "CMD Grids_T (no voxelise). log1p + FRESH pool z-score.")
     args = ap.parse_args()
 
     norm = np.load(NORM3D, allow_pickle=True).item()
@@ -213,6 +266,11 @@ def main():
         ne_m, ne_s = float(norm["ne"]["mean"]), float(norm["ne"]["std"])
         print(f"norm3d ne mean/std = {ne_m:.4f}/{ne_s:.4f} (log10, no suite div)")
 
+    # T (opt-in): log1p + FRESH pool z-score (public Grids_T; norm3d T is a mismatched field).
+    t_m = t_s = None
+    if args.with_temp:
+        t_m, t_s = compute_temp_stat(args.suites)
+
     counts = {}
     for s in args.suites:
         if not args.no_mgas:
@@ -223,6 +281,8 @@ def main():
             counts[s] = process_suite_vel(s, vn_m, vn_s, args.out, args.log_every)
         if args.with_ne:
             counts[s] = process_suite_ne(s, ne_m, ne_s, args.out, args.log_every)
+        if args.with_temp:
+            counts[s] = process_suite_temp(s, t_m, t_s, args.out, args.log_every)
 
     meta = dict(
         mgas_mean=np.float32(mg_m), mgas_std=np.float32(mg_s),
@@ -243,13 +303,17 @@ def main():
         meta["ne_mean"] = np.float32(ne_m)
         meta["ne_std"] = np.float32(ne_s)
         meta["ne_transform"] = np.array("log10+zscore(norm3d ne); no suite div; public Grids_ne")
+    if t_m is not None:
+        meta["t_mean"] = np.float32(t_m)
+        meta["t_std"] = np.float32(t_s)
+        meta["t_transform"] = np.array("log1p+zscore(FRESH pool stat); no suite div; public Grids_T")
     np.savez(os.path.join(args.out, "norm_meta.npz"), **meta)
 
     # Mirror stats into the repo-local norm_latent.npz so infer.py picks up the
     # SAME normalisation. MERGE-and-update (don't clobber): preserve existing keys and
     # overlay whatever this run computed -> e.g. `--with_vel --no_nbody` keeps the prior
     # nbody/mgas stats while adding nbodyvel.
-    if nb_m is not None or vn_m is not None or ne_m is not None:
+    if nb_m is not None or vn_m is not None or ne_m is not None or t_m is not None:
         local = "cached/norm_latent.npz"
         os.makedirs(os.path.dirname(local), exist_ok=True)
         local_kw = {}
@@ -265,10 +329,13 @@ def main():
             local_kw.update(nbodyvel_mean=np.float32(vn_m), nbodyvel_std=np.float32(vn_s))
         if ne_m is not None:
             local_kw.update(ne_mean=np.float32(ne_m), ne_std=np.float32(ne_s))
+        if t_m is not None:
+            local_kw.update(t_mean=np.float32(t_m), t_std=np.float32(t_s))
         np.savez(local, **local_kw)
         print(f"Wrote {local} (infer norm stats"
               + (" + nbodyvel" if vn_m is not None else "")
-              + (" + ne" if ne_m is not None else "") + ")")
+              + (" + ne" if ne_m is not None else "")
+              + (" + T" if t_m is not None else "") + ")")
     print(f"\nDone. cache -> {args.out}")
 
 

@@ -17,11 +17,11 @@ MGAS_TMPL = CACHE + "/Mgas_norm_{suite}_LH_128_z=0.0.npy"
 NE_TMPL = CACHE + "/Ne_norm_{suite}_LH_128_z=0.0.npy"
 
 
-def encode_suite(model, suite, dev, clamp, batch, max_n):
+def encode_suite(model, suite, dev, clamp, batch, max_n, latent_dim):
     mg = np.load(MGAS_TMPL.format(suite=suite), mmap_mode="r")
     ne = np.load(NE_TMPL.format(suite=suite), mmap_mode="r")
     n = len(mg) if max_n in (0, None) else min(max_n, len(mg))
-    out = np.empty((n, model.gas_encoder.proj.out_features), dtype=np.float32)
+    out = np.empty((n, latent_dim), dtype=np.float32)
     for i in range(0, n, batch):
         j = min(i + batch, n)
         a = np.asarray(mg[i:j], dtype=np.float32)
@@ -63,11 +63,13 @@ def main():
         args.checkpoint, cfg=cfg, strict=False).to(dev).eval()
     for p in model.parameters():
         p.requires_grad_(False)
-    print(f"latent_dim={model.gas_encoder.proj.out_features} | suites={suites} | dev={dev}")
+    latent_dim = int(model.latent_dim)
+    print(f"latent_dim={latent_dim} | head={model.gas_encoder.latent_head} "
+          f"| suites={suites} | dev={dev}")
 
     Z_parts, ranges, off = [], {}, 0
     for s in suites:
-        z = encode_suite(model, s, dev, clamp, args.batch, args.max_per_suite)
+        z = encode_suite(model, s, dev, clamp, args.batch, args.max_per_suite, latent_dim)
         Z_parts.append(z); ranges[s] = (off, off + len(z)); off += len(z)
     Z = np.concatenate(Z_parts, 0).astype(np.float32)
 

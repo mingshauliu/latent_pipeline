@@ -20,10 +20,16 @@ D = 16
 CKPT = "latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt"
 
 
-def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tanh"):
+def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tanh",
+          target_fields=None):
+    data = dict(use_velocity=use_vel, resolution=D, box_size=25,
+                crop_size=None, clamp_val=10, n_cosmo=2)
+    if target_fields is not None:
+        data["target_fields"] = target_fields
+    else:
+        data["use_ne"] = use_ne
     return dict(
-        data=dict(use_ne=use_ne, use_velocity=use_vel, resolution=D, box_size=25,
-                  crop_size=None, clamp_val=10, n_cosmo=2),
+        data=data,
         model=dict(in_channels=in_ch, base_channels=8, out_channels=out_ch, cosmo_dim=2,
                    latent_dim=8, variational=False, encoder_base=encoder_base, encoder_dropout=0.0,
                    circular_padding=True, norm_type="pixel", latent_head=latent_head),
@@ -33,11 +39,13 @@ def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tan
     )
 
 
-def batch(use_ne, use_vel=False):
+def batch(use_ne, use_vel=False, n_extra=None):
+    # n_extra overrides use_ne: emit that many extra-target channels before cosmo.
+    n_t = n_extra if n_extra is not None else (1 if use_ne else 0)
     nb, mg, co = torch.randn(2, 1, D, D, D), torch.randn(2, 1, D, D, D), torch.randn(2, 2)
     out = [nb, mg]
-    if use_ne:
-        out.append(torch.randn(2, 1, D, D, D))   # ne (before cosmo)
+    for _ in range(n_t):
+        out.append(torch.randn(2, 1, D, D, D))    # extra target (before cosmo)
     out.append(co)
     if use_vel:
         out.append(torch.randn(2, 1, D, D, D))    # vel (after cosmo)
@@ -121,6 +129,33 @@ def main():
         l, _, p, _ = m._step(b, augment=True, sample_latent=True); l.backward()
         seq = type(m.gas_encoder.proj).__name__
         print(f"[5:{h}] OK z{tuple(z.shape)} |z|max {z.abs().max():.3f} proj={seq} loss{float(l):.4f}")
+
+    # 6. FULL multi-task [Mgas,ne,T] + velocity: target_fields=[ne,T], in=5/out=3, encoder 3-ch.
+    cfg6 = mkcfg(None, 5, 3, use_vel=True, target_fields=["ne", "T"], latent_head="mlp")
+    m6 = FlowMatchingModel(cfg6).to(dev)
+    assert m6.n_extra == 2 and m6.out_channels == 3 and m6.gas_encoder.stem.weight.shape[1] == 3
+    b = tuple(t.to(dev) for t in batch(None, use_vel=True, n_extra=2))   # (nb,mg,ne,T,co,vel)
+    l, _, p, _ = m6._step(b, augment=True, sample_latent=True); l.backward()
+    s = m6.sample(torch.randn(2, 1, D, D, D, device=dev), torch.randn(2, 2, device=dev),
+                  torch.zeros(2, 8, device=dev), num_steps=3,
+                  vel=torch.randn(2, 1, D, D, D, device=dev))
+    assert p.shape[1] == 3 and s.shape[1] == 3, (p.shape, s.shape)
+    print(f"[6] ne+T+vel OK pred{tuple(p.shape)} loss{float(l):.4f} sample{tuple(s.shape)} in=5/out=3")
+
+    # 6b. warm-load real ep486 (1-ch) -> [Mgas,ne,T]+vel (in=5/out=3, encoder base40 fresh).
+    if os.path.exists(CKPT):
+        cfg = mkcfg(None, 5, 3, use_vel=True, target_fields=["ne", "T"], encoder_base=40, latent_head="mlp")
+        cfg["model"]["base_channels"] = 128
+        mw = FlowMatchingModel(cfg)
+        ck = torch.load(CKPT, map_location="cpu", weights_only=False)
+        warm_load_partial(mw, ck["state_dict"])
+        oc = mw.net.out_conv.weight
+        print(f"    out_conv mgas|max|={oc[0].abs().max():.3e} ne|max|={oc[1].abs().max():.3e} "
+              f"T|max|={oc[2].abs().max():.3e} (ne/T rows ~0)")
+        mw = mw.to(dev)
+        b = tuple(t.to(dev) for t in batch(None, use_vel=True, n_extra=2))
+        l, _, p, _ = mw._step(b, augment=True, sample_latent=True); l.backward()
+        print(f"[6b] warm-load 2->5 in / 1->3 out / encoder base16->40 fresh OK loss{float(l):.4f}")
     print("ALL OK")
 
 

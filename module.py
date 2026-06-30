@@ -5,6 +5,7 @@ Ported from ../upscaling/train.py::FlowMatchingModel, extended with a GasEncoder
 both the UNet and the encoder.
 """
 
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -95,6 +96,13 @@ class FlowMatchingModel(pl.LightningModule):
         self.xcorr_method = t.get("xcorr_method", "euler")
         self.xcorr_rtol = t.get("xcorr_rtol", 1e-4)
         self.xcorr_atol = t.get("xcorr_atol", 1e-4)
+        # Latent t-SNE diagnostic at the xcorr/pk epochs: encode the first
+        # tsne_n_batches val-batch targets ((Mgas) or (Mgas,ne)) through the ResNet
+        # encoder -> 8-dim summary -> t-SNE 2D, titled with participation-ratio
+        # eff-dim (the robust collapse signal). 0 = off (default, backward compatible).
+        self.tsne_n_batches = int(t.get("tsne_n_batches", 0))
+        self.tsne_out_dir = t.get("tsne_out_dir", "outputs")
+        self._tsne_lat = []
         self.skip_nan_loss = bool(t.get("skip_nan_loss", True))
         # Skip finite-but-huge loss batches (heavy-tail Nbody outlier cubes drive
         # per-batch MSE to ~1e4 and nuke the converged model). Normal loss is
@@ -109,13 +117,19 @@ class FlowMatchingModel(pl.LightningModule):
         # cat([x_t, nbody, vel]) -> model.in_channels MUST be 3. Velocity is a STATIC
         # conditioning channel (NOT part of the x0/x1 flow). Default false = baseline.
         self.use_velocity = bool(d.get("use_velocity", False))
-        # Extra Mgas-paired OUTPUT (target) channel: electron density (ne). When true the
-        # loader yields ne (a 2nd target), the flow runs out_channels=2 = (Mgas, ne)
-        # jointly (x0 = nbody repeated to 2ch + noise, x1 = cat([mgas, ne])), and the
-        # latent encoder takes the stacked (Mgas, ne) -> in_channels=2. model.out_channels
-        # MUST be 2 and model.in_channels = out_channels + 1 [+1 vel]. Default false =
-        # single-channel Mgas baseline (fully backward compatible).
-        self.use_ne = bool(d.get("use_ne", False))
+        # Extra Mgas-paired OUTPUT (target) channels: an ORDERED list (e.g. [ne], [ne, T]).
+        # Mgas is always channel 0. The flow runs out_channels = 1 + len(target_fields)
+        # jointly (x0 = nbody repeated to out_channels + noise, x1 = cat([mgas, *extras])),
+        # and the latent encoder takes the stacked (Mgas, *extras) -> in_channels = same.
+        # model.out_channels MUST equal 1+len, model.in_channels = out_channels + 1 [+1 vel].
+        # Back-compat: `use_ne: true` (no target_fields) == target_fields:[ne]. Default
+        # [] = single-channel Mgas baseline (fully backward compatible).
+        tf = d.get("target_fields")
+        if tf is None:
+            tf = ["ne"] if d.get("use_ne", False) else []
+        self.target_fields = list(tf)
+        self.n_extra = len(self.target_fields)
+        self.use_ne = "ne" in self.target_fields   # legacy flag (display / infer paths)
         self.out_channels = m["out_channels"]
 
         # Variational (beta-VAE) latent: GasEncoder -> (mu, logvar), z reparametrised,
@@ -141,7 +155,7 @@ class FlowMatchingModel(pl.LightningModule):
             dropout=m.get("encoder_dropout", 0.1),
             circular_padding=m["circular_padding"],
             variational=self.variational,
-            in_channels=2 if self.use_ne else 1,   # encode (Mgas, ne) jointly when on
+            in_channels=1 + self.n_extra,          # encode (Mgas, *extras) jointly
             latent_head=m.get("latent_head", "tanh"),  # raw|mlp drop tanh (encoder3D)
         )
         if t.get("gradient_checkpointing", False):
@@ -245,48 +259,44 @@ class FlowMatchingModel(pl.LightningModule):
         return self.kl_beta * min(1.0, self.current_epoch / self.kl_warmup_epochs)
 
     def _unpack(self, batch):
-        """Decode the dataloader tuple by the use_ne / use_velocity flags (NOT by
-        length): (nb, mg, [ne], cosmo, [vel]). Returns (nbody, mgas, ne, cosmo, vel)
-        with ne / vel None when their flag is off."""
+        """Decode the dataloader tuple by n_extra_targets / use_velocity (NOT by length):
+        (nb, mg, *targets, cosmo, [vel]). Returns (nbody, mgas, extras, cosmo, vel) where
+        `extras` is an ordered list (possibly empty) and vel is None when off."""
         nbody, mgas = batch[0], batch[1]
         i = 2
-        ne = None
-        if self.use_ne:
-            ne = batch[i]; i += 1
+        extras = [batch[i + k] for k in range(self.n_extra)]
+        i += self.n_extra
         cosmo = batch[i]; i += 1
         vel = batch[i] if self.use_velocity else None
-        return nbody, mgas, ne, cosmo, vel
+        return nbody, mgas, extras, cosmo, vel
 
-    def _flow_targets(self, nbody, mgas, ne):
-        """Build the flow endpoints. Single channel: x1=mgas, x0=nbody. Multi-task:
-        x1=cat([mgas,ne]) and x0=nbody repeated to out_channels (each target channel
-        flows from the N-body density start, encoder3D-style)."""
-        if ne is None:
+    def _flow_targets(self, nbody, mgas, extras):
+        """Flow endpoints. No extras: x1=mgas, x0=nbody. Multi-task: x1=cat([mgas,*extras])
+        and x0=nbody repeated to out_channels (each target channel flows from the N-body
+        density start, encoder3D-style)."""
+        if not extras:
             return nbody, mgas
-        x1 = torch.cat([mgas, ne], dim=1)                       # (B,2,...)
-        base = nbody.expand(-1, x1.size(1), -1, -1, -1)         # repeat nbody -> 2ch start
+        x1 = torch.cat([mgas, *extras], dim=1)                 # (B, 1+n_extra, ...)
+        base = nbody.expand(-1, x1.size(1), -1, -1, -1)        # repeat nbody -> out_channels
         return base, x1
 
     def _step(self, batch, augment=False, sample_latent=False):
-        nbody, mgas, ne, cosmo, vel = self._unpack(batch)
+        nbody, mgas, extras, cosmo, vel = self._unpack(batch)
         if augment:
-            tensors = [nbody, mgas] + ([ne] if ne is not None else []) \
-                      + ([vel] if vel is not None else [])
+            tensors = [nbody, mgas] + list(extras) + ([vel] if vel is not None else [])
             tensors = list(self.aug(*tensors))                  # shared transform -> aligned
             nbody, mgas = tensors[0], tensors[1]
-            j = 2
-            if ne is not None:
-                ne = tensors[j]; j += 1
+            extras = list(tensors[2:2 + self.n_extra])
             if vel is not None:
-                vel = tensors[j]
+                vel = tensors[2 + self.n_extra]
         B = nbody.size(0)
-        enc_in = mgas if ne is None else torch.cat([mgas, ne], dim=1)
+        enc_in = mgas if not extras else torch.cat([mgas, *extras], dim=1)
         latent, kl = self._encode_latent(enc_in, sample_latent)
         if self.time_sampling == "logitnormal":
             t = torch.sigmoid(torch.randn(B, device=nbody.device))
         else:
             t = torch.rand(B, device=nbody.device)
-        base, x1 = self._flow_targets(nbody, mgas, ne)
+        base, x1 = self._flow_targets(nbody, mgas, extras)
         x0 = (base + torch.randn_like(base) * self.noise_std) if self.noise_std > 0 else base
         t_exp = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_exp) * x0 + t_exp * x1
@@ -337,15 +347,65 @@ class FlowMatchingModel(pl.LightningModule):
                           and self.current_epoch % self.xcorr_every == 0)
         if HAS_PKL and is_xcorr_epoch and batch_idx == 0:
             self._log_xcorr(batch)
+        # collect encoder latents over the first K val batches (rank 0) for the t-SNE
+        if (is_xcorr_epoch and self.tsne_n_batches > 0 and self.trainer.is_global_zero
+                and batch_idx < self.tsne_n_batches):
+            self._collect_tsne(batch)
         return loss
 
+    @torch.no_grad()
+    def _collect_tsne(self, batch):
+        _, mgas, extras, _, _ = self._unpack(batch)
+        enc_in = mgas.float() if not extras else torch.cat([mgas.float(), *[e.float() for e in extras]], dim=1)
+        z, _ = self._encode_latent(enc_in, sample_latent=False)   # (B, latent_dim), EMA wts
+        self._tsne_lat.append(z.detach().float().cpu().numpy())
+
     def on_validation_epoch_start(self):
+        self._tsne_lat = []
         if self.ema_enabled and self._ema_shadow is not None:
             self._ema_swap_in()
 
     def on_validation_epoch_end(self):
+        if self.tsne_n_batches > 0 and self.trainer.is_global_zero and self._tsne_lat:
+            self._plot_latent_tsne()
+        self._tsne_lat = []
         if self.ema_enabled and self._ema_backup is not None:
             self._ema_swap_out()
+
+    def _plot_latent_tsne(self):
+        Z = np.concatenate(self._tsne_lat, 0)        # (N, latent_dim)
+        N = len(Z)
+        # participation-ratio eff-dim = (sum lambda)^2 / sum lambda^2 over cov eigenvalues
+        cov = np.cov(Z, rowvar=False)
+        w = np.clip(np.linalg.eigvalsh(cov), 0, None)
+        eff = float(w.sum() ** 2 / (np.square(w).sum() + 1e-12)) if w.sum() > 0 else 0.0
+        self.log("latent_eff_dim", eff, on_epoch=True, prog_bar=False)
+        try:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            from sklearn.manifold import TSNE
+            if N >= 5:
+                perp = max(2, min(30, (N - 1) // 3))
+                emb = TSNE(n_components=2, init="pca", perplexity=perp,
+                           random_state=42).fit_transform(Z)
+            else:
+                emb = Z[:, :2]
+            os.makedirs(self.tsne_out_dir, exist_ok=True)
+            fig, ax = plt.subplots(figsize=(5, 4.2))
+            ax.scatter(emb[:, 0], emb[:, 1], s=12, alpha=0.6, c="C0")
+            ax.set_title(f"encoder latent t-SNE — ep{self.current_epoch} "
+                         f"(N={N}, eff-dim {eff:.2f}/{self.latent_dim})")
+            ax.set_xticks([]); ax.set_yticks([])
+            fig.tight_layout()
+            path = os.path.join(self.tsne_out_dir,
+                                f"latent_tsne_ep{self.current_epoch:04d}.png")
+            fig.savefig(path, dpi=120)
+            # log the figure through the Lightning logger (WandbLogger.log_image)
+            if self.logger is not None and hasattr(self.logger, "log_image"):
+                self.logger.log_image(key="latent_tsne", images=[path],
+                                      step=self.global_step)
+            plt.close(fig)
+        except Exception as e:
+            print(f"  latent t-SNE failed: {e}")
 
     # ── EMA ──────────────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -432,12 +492,12 @@ class FlowMatchingModel(pl.LightningModule):
     def _log_xcorr(self, batch):
         # Oracle latent: encode the TRUE Mgas (upper bound on FM transport given
         # the right latent). Inference without truth uses latent_mode in infer.py.
-        nbody, mgas, ne, cosmo, vel = self._unpack(batch)
+        nbody, mgas, extras, cosmo, vel = self._unpack(batch)
         nb32, cosmo32 = nbody.float(), cosmo.float()
         B, dev = nb32.size(0), nb32.device
         oc = self.out_channels
-        # oracle latent = encode the TRUE target ((Mgas) or (Mgas,ne)); variational -> mu.
-        enc_in = mgas.float() if ne is None else torch.cat([mgas.float(), ne.float()], dim=1)
+        # oracle latent = encode the TRUE targets (Mgas[, *extras]); variational -> mu.
+        enc_in = mgas.float() if not extras else torch.cat([mgas.float(), *[e.float() for e in extras]], dim=1)
         latent, _ = self._encode_latent(enc_in, sample_latent=False)
         base = nb32 if oc == 1 else nb32.expand(-1, oc, -1, -1, -1)
         x0 = base + torch.randn_like(base) * self.noise_std if self.noise_std > 0 else base.clone()
