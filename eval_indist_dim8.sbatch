@@ -20,7 +20,7 @@ source /mnt/home/mliu1/env/bin/activate
 mkdir -p logs outputs/dim8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-CKPT=latent-pipeline/sv6mp9wt/checkpoints/best-epoch=269-val_loss=0.013353.ckpt
+CKPT=latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt   # current best dim8
 echo "Node: $(hostname) | ckpt: $CKPT"
 nvidia-smi
 

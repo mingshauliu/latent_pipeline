@@ -31,6 +31,9 @@ model:
   latent_dim: 8
   variational: false
   latent_head: mlp     # encoder3D ResNetBranch head: Linear->SiLU->Linear, NO tanh.
+  zero_init_film: false  # LIVE FiLM (encoder3D): latent perturbs output from step 0 ->
+                         # encoder gets gradient -> latent spreads (no starvation).
+  zero_init_out: false   # LIVE out_conv: no 1-step gradient block / early latent damp.
   encoder_base: 40     # ~param-matched to encoder3D ResNetBranch. Encoder trains FRESH
                        # (base != ep486's 16); 3-ch (Mgas,ne,T) encode = full feedback
                        # signal -> the bet to break the eff-dim 1.0/8 collapse seen with
@@ -68,11 +71,12 @@ training:
   kl_beta: 0.001
   kl_warmup_epochs: 30
   kl_free_bits: 0.5
-  # warm-start UNet backbone from dim8 best ep486 (single-channel, in=2). init_strict:false
-  # -> warm_load_partial: enc1 input 2->5 (role-remap: Mgas x_t + nbody cols kept; new ne/T
-  # x_t + vel cols fresh), out_conv 1->3 (ne+T rows zero-init), encoder FRESH (base 16->40,
-  # 3-ch stem). Do NOT warm-start the encoder from the collapsed ne_vel ckpt.
-  init_strict: false
+  # TRAIN FRESH (2026-07-01). NO warm-start: warm-starting the decoder from the
+  # collapsed single-channel ep486 + zero-init FiLM locked the model in the
+  # latent-ignoring basin -> collapse even with the rich 3-ch (Mgas,ne,T) target.
+  # encoder3D trains fresh + live FiLM -> latent spreads. Match that: init_from null,
+  # init_strict true (fresh, no partial load), zero_init_film/out false.
+  init_strict: true
   seed: 42
   resume_from: null
   wandb_project: latent-pipeline-nevelT
@@ -80,7 +84,7 @@ training:
     enabled: true
     decay: 0.9999
     warmup_steps: 5000
-  init_from: latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt
+  init_from: null
   cosine_t_max: 150
   eta_min: 1.0e-06
 inference:

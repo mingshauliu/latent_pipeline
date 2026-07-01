@@ -21,7 +21,7 @@ CKPT = "latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ck
 
 
 def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tanh",
-          target_fields=None):
+          target_fields=None, zero_init_film=True, zero_init_out=True):
     data = dict(use_velocity=use_vel, resolution=D, box_size=25,
                 crop_size=None, clamp_val=10, n_cosmo=2)
     if target_fields is not None:
@@ -32,7 +32,8 @@ def mkcfg(use_ne, in_ch, out_ch, use_vel=False, encoder_base=4, latent_head="tan
         data=data,
         model=dict(in_channels=in_ch, base_channels=8, out_channels=out_ch, cosmo_dim=2,
                    latent_dim=8, variational=False, encoder_base=encoder_base, encoder_dropout=0.0,
-                   circular_padding=True, norm_type="pixel", latent_head=latent_head),
+                   circular_padding=True, norm_type="pixel", latent_head=latent_head,
+                   zero_init_film=zero_init_film, zero_init_out=zero_init_out),
         training=dict(lr=2e-4, weight_decay=1e-3, noise_std=0.1, time_sampling="logitnormal",
                       max_epochs=10, xcorr_every_n_epochs=0, xcorr_num_steps=4,
                       scheduler="cosine", warmup_epochs=0, ema=dict(enabled=False)),
@@ -156,6 +157,26 @@ def main():
         b = tuple(t.to(dev) for t in batch(None, use_vel=True, n_extra=2))
         l, _, p, _ = mw._step(b, augment=True, sample_latent=True); l.backward()
         print(f"[6b] warm-load 2->5 in / 1->3 out / encoder base16->40 fresh OK loss{float(l):.4f}")
+
+    # 7. LIVE FiLM vs zero-init: latent MUST influence the output at init when live.
+    #    This is the fix for latent collapse — zero-init FiLM feeds latent through a
+    #    zeroed proj so it has no effect / no gradient at step 0.
+    for zi, tag in [(True, "zero-init"), (False, "LIVE")]:
+        m = FlowMatchingModel(mkcfg(None, 5, 3, use_vel=True, target_fields=["ne", "T"],
+                                    encoder_base=8, latent_head="mlp",
+                                    zero_init_film=zi, zero_init_out=zi)).to(dev).eval()
+        x = torch.randn(2, 5, D, D, D, device=dev); t = torch.rand(2, device=dev)
+        c = torch.randn(2, 2, device=dev)
+        with torch.no_grad():
+            o0 = m.net(x, t, c, torch.zeros(2, 8, device=dev))
+            o1 = m.net(x, t, c, torch.randn(2, 8, device=dev))
+        eff = float((o0 - o1).abs().mean()); omean = float(o0.abs().mean())
+        print(f"[7] {tag:9s} out|mean|={omean:.3e} latent_effect={eff:.3e}")
+        if zi:
+            assert eff < 1e-6, f"zero-init should kill latent effect, got {eff}"
+        else:
+            assert eff > 1e-4, f"LIVE FiLM must let latent affect output, got {eff}"
+    print("[7] LIVE FiLM lets latent affect output at init; zero-init kills it (as designed)")
     print("ALL OK")
 
 

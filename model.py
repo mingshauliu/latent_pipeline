@@ -48,12 +48,18 @@ def sinusoidal_embedding(t, dim, max_period=10000):
 
 
 class FiLM(nn.Module):
-    def __init__(self, cond_dim, feat_dim):
+    def __init__(self, cond_dim, feat_dim, zero_init=True):
         super().__init__()
         self.proj = nn.Linear(cond_dim, feat_dim * 2)
-        # Zero-init: gamma=0 -> (1+gamma)*x = x, beta=0 at init (identity).
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        # zero_init=True: gamma=0 -> (1+gamma)*x = x, beta=0 at init (identity) —
+        # stable warm-start, but the conditioning (incl. latent) has ZERO influence
+        # at step 0 -> no gradient to the encoder -> LATENT STARVATION when the
+        # decoder is warm-started/competent. zero_init=False = LIVE FiLM (encoder3D
+        # style): conditioning perturbs the output from step 0 -> latent gets
+        # gradient immediately -> the latent actually spreads.
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, c):
         s, b = self.proj(c).chunk(2, dim=1)
@@ -65,16 +71,17 @@ class FiLM(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, cond_dim, circular, down=True, norm_type="pixel"):
+    def __init__(self, in_ch, out_ch, cond_dim, circular, down=True, norm_type="pixel",
+                 zero_init_film=True):
         super().__init__()
         self.down = down
         self.pad_mode = "circular" if circular else "constant"
         self.norm1 = _make_norm(norm_type, in_ch)
         self.conv1 = nn.Conv3d(in_ch, out_ch, 3)
-        self.film1 = FiLM(cond_dim, out_ch)
+        self.film1 = FiLM(cond_dim, out_ch, zero_init=zero_init_film)
         self.norm2 = _make_norm(norm_type, out_ch)
         self.conv2 = nn.Conv3d(out_ch, out_ch, 3)
-        self.film2 = FiLM(cond_dim, out_ch)
+        self.film2 = FiLM(cond_dim, out_ch, zero_init=zero_init_film)
         self.act = nn.SiLU()
         self.skip = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
         if self.down:
@@ -96,7 +103,8 @@ class ClassicUNet(nn.Module):
     """3-level UNet velocity field. Conditioning = time + cosmo + latent via FiLM."""
 
     def __init__(self, in_channels=2, base_channels=128, out_channels=1,
-                 cosmo_dim=2, latent_dim=8, circular_padding=True, norm_type="pixel"):
+                 cosmo_dim=2, latent_dim=8, circular_padding=True, norm_type="pixel",
+                 zero_init_film=True, zero_init_out=True):
         super().__init__()
         bc = base_channels
         circ = circular_padding
@@ -111,33 +119,38 @@ class ClassicUNet(nn.Module):
         self.cond_fuse = nn.Sequential(
             nn.Linear(64 + 64 + latent_dim, cd * 2), nn.SiLU(), nn.Linear(cd * 2, cd))
 
-        self.enc1 = UNetBlock(in_channels, bc, cd, circ, down=True, norm_type=nt)
-        self.enc2 = UNetBlock(bc, bc, cd, circ, down=True, norm_type=nt)
-        self.enc3 = UNetBlock(bc, 2*bc, cd, circ, down=True, norm_type=nt)
+        zif = zero_init_film
+        self.enc1 = UNetBlock(in_channels, bc, cd, circ, down=True, norm_type=nt, zero_init_film=zif)
+        self.enc2 = UNetBlock(bc, bc, cd, circ, down=True, norm_type=nt, zero_init_film=zif)
+        self.enc3 = UNetBlock(bc, 2*bc, cd, circ, down=True, norm_type=nt, zero_init_film=zif)
 
         self.bn_norm1 = _make_norm(nt, 2*bc)
         self.bn_conv1 = nn.Conv3d(2*bc, 2*bc, 3)
         self.bn_norm2 = _make_norm(nt, 2*bc)
         self.bn_conv2 = nn.Conv3d(2*bc, 2*bc, 3)
-        self.bn_film = FiLM(cd, 2*bc)
+        self.bn_film = FiLM(cd, 2*bc, zero_init=zif)
 
         self.up3 = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
         self.up3_conv = nn.Conv3d(2*bc, 2*bc, 3)
-        self.dec3 = UNetBlock(4*bc, 2*bc, cd, circ, down=False, norm_type=nt)
+        self.dec3 = UNetBlock(4*bc, 2*bc, cd, circ, down=False, norm_type=nt, zero_init_film=zif)
 
         self.up2 = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
         self.up2_conv = nn.Conv3d(2*bc, bc, 3)
-        self.dec2 = UNetBlock(2*bc, bc, cd, circ, down=False, norm_type=nt)
+        self.dec2 = UNetBlock(2*bc, bc, cd, circ, down=False, norm_type=nt, zero_init_film=zif)
 
         self.up1 = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
         self.up1_conv = nn.Conv3d(bc, bc // 2, 3)
-        self.dec1 = UNetBlock(bc + bc // 2, bc // 2, cd, circ, down=False, norm_type=nt)
+        self.dec1 = UNetBlock(bc + bc // 2, bc // 2, cd, circ, down=False, norm_type=nt, zero_init_film=zif)
 
         self.out_conv = nn.Conv3d(bc // 2, out_channels, 1)
-        # Zero-init final conv: v=0 at init -> loss = E[(x1-x0)^2] without
-        # amplification from random output (target has large mean offset).
-        nn.init.zeros_(self.out_conv.weight)
-        nn.init.zeros_(self.out_conv.bias)
+        # zero_init_out=True: v=0 at init -> loss = E[(x1-x0)^2] without amplification
+        # from random output. BUT a zero out_conv also blocks gradient to the body for
+        # one step + damps early latent gradient -> pair zero_init_out=False with a
+        # live FiLM (encoder3D parity) for fresh runs. gradient_clip + loss_spike guard
+        # handle the larger init loss.
+        if zero_init_out:
+            nn.init.zeros_(self.out_conv.weight)
+            nn.init.zeros_(self.out_conv.bias)
 
     def set_pad_mode(self, mode):
         self.pad_mode = mode

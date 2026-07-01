@@ -29,15 +29,18 @@ model:
   cosmo_dim: 2
   latent_dim: 8
   variational: false
+  zero_init_film: false  # LIVE FiLM (encoder3D): latent perturbs output from step 0 ->
+                         # encoder gets gradient -> latent spreads (no starvation).
+  zero_init_out: false   # LIVE out_conv: no 1-step gradient block / early latent damp.
   latent_head: mlp     # encoder3D ResNetBranch head: Linear->SiLU->Linear, NO tanh.
                        # Drops the tanh saturation that clustered suites / collapsed
                        # the latent (ep486 tanh eff-dim 1.48/8). Encoder is fresh here
                        # (base40 != ep486's 16) so the new head costs nothing.
   encoder_base: 40     # ~param-matched to encoder3D ResNetBranch (9.18M vs 8.27M).
-                       # Encoder trains FRESH (base differs from ep486's 16); the UNet
-                       # backbone still warm-starts. The bet: encoder3D-sized encoder +
-                       # richer 2-ch (Mgas,ne) encode target + velocity input + our
-                       # schedule -> a non-collapsed latent (ep486 eff-dim was 1.48/8).
+                       # Whole model trains FRESH now (2026-07-01). The bet: encoder3D-
+                       # sized encoder + richer 2-ch (Mgas,ne) encode target + velocity
+                       # input + live FiLM + fresh train -> a non-collapsed latent
+                       # (ep486 eff-dim was 1.48/8; warm-started ne_vel collapsed to 1.0).
   encoder_dropout: 0.1
   circular_padding: true
   norm_type: pixel
@@ -73,21 +76,20 @@ training:
   kl_beta: 0.001
   kl_warmup_epochs: 30
   kl_free_bits: 0.5
-  # warm-start UNet backbone from dim8 best ep486 (single-channel, in=2). init_strict:false
-  # -> warm_load_partial: enc1 input 2->4 (role-remap: Mgas x_t + nbody cols kept; new ne
-  # x_t + vel cols fresh), out_conv 1->2 (ne row zero-init), encoder FRESH (base 16->40).
-  init_strict: false
+  # TRAIN FRESH (2026-07-01). NO warm-start: warm-starting the decoder from the
+  # collapsed single-channel ep486 + zero-init FiLM locked the model in the
+  # latent-ignoring basin -> collapse (ne_vel hit eff-dim 1.0/8). encoder3D trains
+  # fresh + live FiLM -> latent spreads. Match: init_from null, init_strict true,
+  # zero_init_film/out false.
+  init_strict: true
   seed: 42
-  # 2026-06-26: continue (job 6543593 died ~ep41, val 0.009 still bouncing). resume_from
-  # restores optimiser+scheduler+epoch -> picks up cosine 41->150 (init_from auto-ignored
-  # when resume set, train.py:199). Back to null for a fresh run from ep486.
-  resume_from: latent-pipeline-nevel/vniq3c7p/checkpoints/last.ckpt
+  resume_from: null
   wandb_project: latent-pipeline-nevel
   ema:
     enabled: true
     decay: 0.9999
     warmup_steps: 5000
-  init_from: latent-pipeline/ffdsq458/checkpoints/best-epoch=486-val_loss=0.012231.ckpt
+  init_from: null
   cosine_t_max: 150
   eta_min: 1.0e-06
 inference:

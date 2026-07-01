@@ -148,6 +148,8 @@ class FlowMatchingModel(pl.LightningModule):
             latent_dim=self.latent_dim,
             circular_padding=m["circular_padding"],
             norm_type=m.get("norm_type", "pixel"),
+            zero_init_film=m.get("zero_init_film", True),  # False = live FiLM (encoder3D)
+            zero_init_out=m.get("zero_init_out", True),    # False = live out_conv
         )
         self.gas_encoder = GasEncoder(
             latent_dim=self.latent_dim,
