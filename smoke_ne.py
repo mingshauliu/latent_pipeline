@@ -177,6 +177,33 @@ def main():
         else:
             assert eff > 1e-4, f"LIVE FiLM must let latent affect output, got {eff}"
     print("[7] LIVE FiLM lets latent affect output at init; zero-init kills it (as designed)")
+
+    # 8. ema.include_encoder=False -> encoder LIVE: shadow/bake carry net.* only,
+    #    default (True) still shadows gas_encoder.* (backward compat), ckpt reloads.
+    for inc in (True, False):
+        cfg = mkcfg(False, 2, 1)
+        cfg["training"]["ema"] = dict(enabled=True, decay=0.9, warmup_steps=0,
+                                      include_encoder=inc)
+        m8 = FlowMatchingModel(cfg).to(dev)
+        m8._ema_update(); m8._ema_update()
+        keys = set(m8._ema_shadow)
+        has_enc = any(k.startswith("gas_encoder.") for k in keys)
+        assert any(k.startswith("net.") for k in keys)
+        assert has_enc == inc, (inc, sorted(keys)[:3])
+        # swap-in must leave encoder params untouched when excluded
+        enc_w = m8.gas_encoder.stem.weight.detach().clone()
+        m8._ema_swap_in()
+        if not inc:
+            assert torch.equal(enc_w, m8.gas_encoder.stem.weight.detach())
+        m8._ema_swap_out()
+        ck = {"state_dict": m8.state_dict()}
+        m8.on_save_checkpoint(ck)
+        assert any(k.startswith("gas_encoder.") for k in ck["ema_shadow"]) == inc
+        if not inc:  # baked state_dict keeps the LIVE encoder bit-exact
+            assert torch.equal(ck["state_dict"]["gas_encoder.stem.weight"].cpu(), enc_w.cpu())
+        m8b = FlowMatchingModel(cfg)
+        m8b.load_state_dict(ck["state_dict"])
+        print(f"[8] ema include_encoder={inc} OK (shadow {'has' if has_enc else 'skips'} encoder, ckpt reloads)")
     print("ALL OK")
 
 

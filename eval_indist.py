@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from module import FlowMatchingModel, xcorr_metric
-from infer import load_norm, norm_field, norm_nbody, nbody_div
+from infer import load_norm, norm_field, norm_nbody, nbody_div, norm_vel, TARGET_SPEC
 
 try:
     import Pk_library as PKL
@@ -68,12 +68,29 @@ def main():
     box = cfg["data"]["box_size"]
     print(f"latent_dim={ldim} | box={box} | mode={args.latent_mode} | dev={dev}")
 
+    # multi-task / velocity ckpts (in5/out3+vel etc.) — mirror infer.py's wiring:
+    # vel = extra CONDITIONING channel, extras (ne/T) = extra OUTPUT channels; the
+    # encoder encodes stacked (Mgas, *extras). Metrics stay on the Mgas channel (0).
+    use_velocity = cfg["data"].get("use_velocity", False)
+    target_fields = cfg["data"].get("target_fields")
+    if target_fields is None:
+        target_fields = ["ne"] if cfg["data"].get("use_ne", False) else []
+    if use_velocity:
+        assert "nbodyvel_mean" in norm, "use_velocity needs nbodyvel stats in norm_latent.npz"
+
     srcs = cfg["inference"]["sources"]
     src = next((s for s in srcs if args.suite and args.suite in s["name"]), srcs[0])
     suite = src["name"]
-    print(f"source: {suite}")
+    print(f"source: {suite} | use_velocity={use_velocity} | target_fields={target_fields}")
     nbody = np.load(src["nbody_path"], mmap_mode="r")
     mgas = np.load(src["mgas_path"], mmap_mode="r")
+    vel_arr = np.load(src["vel_path"], mmap_mode="r") if use_velocity else None
+    target_refs = []
+    if args.latent_mode == "encode":
+        for f in target_fields:
+            pk = TARGET_SPEC[f]["path"]
+            assert src.get(pk), f"encode + target '{f}' needs src.{pk}"
+            target_refs.append(np.load(src[pk], mmap_mode="r"))
     cosmo_all = np.loadtxt(src["param_path"]).astype(np.float32)[:, :cfg["data"].get("n_cosmo", 2)]
 
     N = min(args.n, len(nbody))
@@ -91,19 +108,35 @@ def main():
             np.clip(nb, -clamp_val, clamp_val, out=nb)
             np.clip(true_n, -clamp_val, clamp_val, out=true_n)
         nb_t = torch.from_numpy(nb)[None, None].to(dev)
+        vel_t = None
+        if use_velocity:
+            vv = norm_vel(np.asarray(vel_arr[i], dtype=np.float32),
+                          norm["nbodyvel_mean"], norm["nbodyvel_std"])
+            if clamp_val is not None:
+                np.clip(vv, -clamp_val, clamp_val, out=vv)
+            vel_t = torch.from_numpy(vv)[None, None].to(dev)
         cosmo = (cosmo_all[i] - norm["cosmo_mean"]) / norm["cosmo_std"]
         cosmo_t = torch.from_numpy(cosmo.astype(np.float32))[None].to(dev)
 
         if args.latent_mode == "encode":
+            enc_in = torch.from_numpy(true_n)[None, None].to(dev)
+            for f, ref in zip(target_fields, target_refs):
+                spec = TARGET_SPEC[f]
+                tv_ = spec["norm"](np.asarray(ref[i], dtype=np.float32),
+                                   norm[spec["mkey"]], norm[spec["skey"]])
+                if clamp_val is not None:
+                    np.clip(tv_, -clamp_val, clamp_val, out=tv_)
+                enc_in = torch.cat([enc_in, torch.from_numpy(tv_)[None, None].to(dev)], dim=1)
             with torch.no_grad():
-                enc = model.gas_encoder(torch.from_numpy(true_n)[None, None].to(dev))
+                enc = model.gas_encoder(enc_in)
             latent = enc[0] if isinstance(enc, tuple) else enc
         else:
             latent = torch.zeros(1, ldim, device=dev)
 
         with torch.no_grad(), torch.amp.autocast(dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
-            s = model.sample(nb_t, cosmo_t, latent, num_steps=args.num_steps, method=args.method)
-        synth_n = s[0, 0].float().cpu().numpy()   # stays in normed log space
+            s = model.sample(nb_t, cosmo_t, latent, num_steps=args.num_steps,
+                             method=args.method, vel=vel_t)
+        synth_n = s[0, 0].float().cpu().numpy()   # Mgas channel, normed log space
         nb_raw.append(nb)
         true_raw.append(true_n)
         synth_raw.append(synth_n)

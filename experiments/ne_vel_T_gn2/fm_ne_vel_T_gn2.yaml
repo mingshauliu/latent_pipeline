@@ -16,47 +16,43 @@ data:
   box_size: 25
   val_split: 0.2
   stats_n_sample: 96
-  # COMBINED: input [nbody, nbody_vel] -> output [Mgas, ne].
-  #   use_velocity -> N-body VELOCITY conditioning input  (NbodyVel_norm cache; --with_vel)
-  #   use_ne       -> ne 2nd OUTPUT target + 2-ch encoder  (Ne_norm cache; --with_ne)
-  # in_channels = out_channels(2 = x_t) + nbody(1) + vel(1) = 4.
+  # FULL multi-task: input [nbody_density, nbody_vel] -> output [Mgas, ne, T] (encoder3D parity).
   use_velocity: true
-  use_ne: true
+  target_fields: [ne, T]
 model:
-  in_channels: 4       # [x_t(2 = Mgas,ne), nbody(1), vel(1)]
+  in_channels: 5       # [x_t(3 = Mgas,ne,T), nbody(1), vel(1)]
   base_channels: 128
-  out_channels: 2      # (Mgas, ne)
+  out_channels: 3      # (Mgas, ne, T)
   cosmo_dim: 2
   latent_dim: 8
   variational: false
-  zero_init_film: false  # LIVE FiLM (encoder3D): latent perturbs output from step 0 ->
-                         # encoder gets gradient -> latent spreads (no starvation).
-  zero_init_out: false   # LIVE out_conv: no 1-step gradient block / early latent damp.
   latent_head: mlp     # encoder3D ResNetBranch head: Linear->SiLU->Linear, NO tanh.
-                       # Drops the tanh saturation that clustered suites / collapsed
-                       # the latent (ep486 tanh eff-dim 1.48/8). Encoder is fresh here
-                       # (base40 != ep486's 16) so the new head costs nothing.
-  encoder_base: 40     # ~param-matched to encoder3D ResNetBranch (9.18M vs 8.27M).
-                       # Whole model trains FRESH now (2026-07-01). The bet: encoder3D-
-                       # sized encoder + richer 2-ch (Mgas,ne) encode target + velocity
-                       # input + live FiLM + fresh train -> a non-collapsed latent
-                       # (ep486 eff-dim was 1.48/8; warm-started ne_vel collapsed to 1.0).
-  encoder_dropout: 0.1
+  zero_init_film: false  # LIVE FiLM (encoder3D parity)
+  zero_init_out: false   # LIVE out_conv
+  encoder_base: 40     # ~param-matched to encoder3D ResNetBranch. Encoder trains FRESH.
+  # PARITY BUNDLE gn2 (2026-07-02): the LAST encoder3D differences, on top of gn's
+  # GroupNorm. gn was confounded (norm AND noise_std both differed from the pixel runs);
+  # this run carries the full bundle:
+  #   encoder_dropout 0.1 -> 0.0  (encoder3D ResNetBlock has NO dropout; dropout noise
+  #                                on the latent teaches the decoder to ignore it)
+  #   weight_decay 1e-3 -> 1e-4   (10x less shrink pressure on FiLM proj + encoder)
+  #   ema.include_encoder: false  (encoder3D has no EMA; live encoder for train AND eval)
+  #   warmup_epochs 5 -> 20       (encoder3D LambdaLR warmup)
+  encoder_dropout: 0.0
   circular_padding: true
-  norm_type: pixel
+  norm_type: group
 training:
   max_epochs: 150
   batch_size: 2
   noise_std: 0.2
   time_sampling: logitnormal
   lr: 0.0002
-  weight_decay: 0.001
+  weight_decay: 0.0001
   gradient_checkpointing: false
   gradient_clip: 1.0
   scheduler: cosine
-  warmup_epochs: 5
-  accumulate_grad: 8   # 2026-06-24: 4->8 (eff-batch 16). Averages out the single
-                       # heavy-tail (ne max|val|~8) cube that bumped fm_ne val ~3x late.
+  warmup_epochs: 20
+  accumulate_grad: 8
   precision: bf16-mixed
   devices: 1
   strategy: ddp
@@ -65,10 +61,8 @@ training:
   save_top_k: 3
   log_every_n_steps: 50
   xcorr_every_n_epochs: 5
-  tsne_n_batches: 16        # encode first 16 val batches' (Mgas,ne) target -> 8-dim
-                            # summary -> t-SNE at each xcorr epoch; titled eff-dim
-                            # (collapse signal). outputs/latent_tsne_ep####.png. 0=off.
-  tsne_out_dir: experiments/ne_vel/tsne
+  tsne_n_batches: 64        # N=128 latents -> less noisy eff-dim (gn's N=32 too small)
+  tsne_out_dir: experiments/ne_vel_T_gn2/tsne
   xcorr_num_steps: 50
   xcorr_method: euler
   skip_nan_loss: true
@@ -76,19 +70,16 @@ training:
   kl_beta: 0.001
   kl_warmup_epochs: 30
   kl_free_bits: 0.5
-  # TRAIN FRESH (2026-07-01). NO warm-start: warm-starting the decoder from the
-  # collapsed single-channel ep486 + zero-init FiLM locked the model in the
-  # latent-ignoring basin -> collapse (ne_vel hit eff-dim 1.0/8). encoder3D trains
-  # fresh + live FiLM -> latent spreads. Match: init_from null, init_strict true,
-  # zero_init_film/out false.
+  # TRAIN FRESH. NO warm-start, live FiLM/out (see latent-collapse root cause 2026-07-01).
   init_strict: true
   seed: 42
   resume_from: null
-  wandb_project: latent-pipeline-nevel
+  wandb_project: latent-pipeline-nevelT-gn2
   ema:
     enabled: true
     decay: 0.9999
     warmup_steps: 5000
+    include_encoder: false   # encoder LIVE (no EMA shadow/swap/bake) — encoder3D parity
   init_from: null
   cosine_t_max: 150
   eta_min: 1.0e-06
@@ -100,7 +91,7 @@ inference:
   latent_mode: mean
   n_stochastic: 1
   latent_stats: cached/latent_stats.npz
-  output_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth_ne_vel
+  output_dir: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth_ne_vel_T_gn2
   sources:
   - name: IllustrisTNG_LH128
     nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_IllustrisTNG_LH_128_z=0.0.npy
@@ -108,6 +99,7 @@ inference:
     param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/params_LH_IllustrisTNG.txt
     n_samples: null
     ne_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/Grids_ne_IllustrisTNG_LH_128_z=0.0.npy
+    t_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/IllustrisTNG/Grids_T_IllustrisTNG_LH_128_z=0.0.npy
     vel_path: /mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_IllustrisTNG_LH_128_z=0.0.npy
   - name: Astrid_LH128
     nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_Astrid_LH_128_z=0.0.npy
@@ -115,6 +107,7 @@ inference:
     param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/params_LH_Astrid.txt
     n_samples: null
     ne_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/Grids_ne_Astrid_LH_128_z=0.0.npy
+    t_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Astrid/Grids_T_Astrid_LH_128_z=0.0.npy
     vel_path: /mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_Astrid_LH_128_z=0.0.npy
   - name: SIMBA_LH128
     nbody_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/Nbody/Grids_Mtot_Nbody_SIMBA_LH_128_z=0.0.npy
@@ -122,6 +115,7 @@ inference:
     param_path: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/params_LH_SIMBA.txt
     n_samples: null
     ne_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/Grids_ne_SIMBA_LH_128_z=0.0.npy
+    t_path: /mnt/home/camels/ceph/PUBLIC_RELEASE/CMD/3D_grids/data/SIMBA/Grids_T_SIMBA_LH_128_z=0.0.npy
     vel_path: /mnt/home/mliu1/ceph/CAMELS-L25n256/Nbody/Grids_Vcdm_Nbody_SIMBA_LH_128_z=0.0.npy
 nf:
   data:
@@ -134,7 +128,7 @@ nf:
     norm3d_path: /mnt/home/mliu1/ceph/norm3d.npy
     mgas_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/Grids_Mgas_{suite}_LH_128_z=0.0.npy
     param_path_tmpl: /mnt/ceph/users/camels/PUBLIC_RELEASE/CMD/3D_grids/data/{suite}/params_LH_{suite}.txt
-    synth_dir_tmpl: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth_ne_vel/{suite}_LH128
+    synth_dir_tmpl: /mnt/ceph/users/mliu1/latent_pipeline_cache/synth_ne_vel_T_gn2/{suite}_LH128
     val_split: 0.2
   model:
     base_channels: 4

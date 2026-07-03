@@ -29,7 +29,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 from module import FlowMatchingModel
-from infer import load_norm, norm_field, norm_nbody, nbody_div, denorm_field
+from infer import (load_norm, norm_field, norm_nbody, nbody_div, denorm_field,
+                   norm_vel, TARGET_SPEC)
 from data import load_nf_pool, nf_mgas_stats, read_cube
 from nf.predict import load_nf, predict_with_uncertainty
 
@@ -78,13 +79,40 @@ def main():
     va_idx = np.sort(va_idx)
     print(f"NF val pool {n_val}; using {len(va_idx)} cubes | latent_mode={args.latent_mode}")
 
-    # ── Nbody / param mmaps per suite (FM source) ────────────────────────────────
-    nbody_src, param_src = {}, {}
+    # ── multi-task / velocity ckpts (in5/out3+vel) — mirror infer.py's wiring ────
+    # vel = extra CONDITIONING channel; extras (ne/T) = extra OUTPUT channels; the
+    # encoder encodes stacked (Mgas, *extras). NF judges the Mgas channel (0) only.
+    # Per-suite vel/ne/T paths come from the matching inference.sources entry.
+    use_velocity = cfg["data"].get("use_velocity", False)
+    target_fields = cfg["data"].get("target_fields")
+    if target_fields is None:
+        target_fields = ["ne"] if cfg["data"].get("use_ne", False) else []
+    if use_velocity:
+        assert "nbodyvel_mean" in norm, "use_velocity needs nbodyvel stats in norm_latent.npz"
+    def _src_for(suite):
+        s = next((s for s in cfg["inference"]["sources"] if suite in s["name"]), None)
+        assert s is not None, f"no inference.sources entry matching suite {suite}"
+        return s
+
+    # ── Nbody / param / vel / target-ref mmaps per suite (FM source) ─────────────
+    nbody_src, param_src, vel_src, ref_src = {}, {}, {}, {}
     for suite in suites:
         nbody_src[suite] = np.load(
             cfg["data"]["nbody_path_tmpl"].format(suite=suite), mmap_mode="r")
         param_src[suite] = np.loadtxt(
             cfg["data"]["param_path_tmpl"].format(suite=suite)).astype(np.float32)
+        if use_velocity:
+            vp = _src_for(suite).get("vel_path")
+            assert vp, f"use_velocity needs vel_path in the {suite} source"
+            vel_src[suite] = np.load(vp, mmap_mode="r")
+        if args.latent_mode == "encode" and target_fields:
+            refs = []
+            for f in target_fields:
+                pk = TARGET_SPEC[f]["path"]
+                rp = _src_for(suite).get(pk)
+                assert rp, f"encode + target '{f}' needs {pk} in the {suite} source"
+                refs.append(np.load(rp, mmap_mode="r"))
+            ref_src[suite] = refs
 
     print(f"Loading FM {args.fm_checkpoint}")
     fm = FlowMatchingModel.load_from_checkpoint(
@@ -100,6 +128,12 @@ def main():
                         norm["nbody_mean"], norm["nbody_std"], div=div)
         np.clip(nb, -clamp_val, clamp_val, out=nb)
         nb_t = torch.from_numpy(nb)[None, None].to(dev)
+        vel_t = None
+        if use_velocity:
+            vv = norm_vel(np.asarray(vel_src[suite][li], dtype=np.float32),
+                          norm["nbodyvel_mean"], norm["nbodyvel_std"])
+            np.clip(vv, -clamp_val, clamp_val, out=vv)
+            vel_t = torch.from_numpy(vv)[None, None].to(dev)
         cosmo = (param_src[suite][li, :2] - norm["cosmo_mean"]) / norm["cosmo_std"]
         cosmo_t = torch.from_numpy(cosmo.astype(np.float32))[None].to(dev)
 
@@ -107,15 +141,23 @@ def main():
             true_n = norm_field(read_cube(mgas_src[si][li]).astype(np.float32),
                                 norm["mgas_mean"], norm["mgas_std"])
             np.clip(true_n, -clamp_val, clamp_val, out=true_n)
+            enc_in = torch.from_numpy(true_n)[None, None].to(dev)
+            for f, ref in zip(target_fields, ref_src.get(suite, [])):
+                spec = TARGET_SPEC[f]
+                tv_ = spec["norm"](np.asarray(ref[li], dtype=np.float32),
+                                   norm[spec["mkey"]], norm[spec["skey"]])
+                np.clip(tv_, -clamp_val, clamp_val, out=tv_)
+                enc_in = torch.cat([enc_in, torch.from_numpy(tv_)[None, None].to(dev)], dim=1)
             with torch.no_grad():
-                enc = fm.gas_encoder(torch.from_numpy(true_n)[None, None].to(dev))
+                enc = fm.gas_encoder(enc_in)
             latent = enc[0] if isinstance(enc, tuple) else enc
         else:
             latent = torch.zeros(1, ldim, device=dev)
 
         with torch.no_grad(), torch.amp.autocast(dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
-            s = fm.sample(nb_t, cosmo_t, latent, num_steps=args.num_steps, method=args.method)
-        synth_n = s[0, 0].float().cpu().numpy()
+            s = fm.sample(nb_t, cosmo_t, latent, num_steps=args.num_steps,
+                          method=args.method, vel=vel_t)
+        synth_n = s[0, 0].float().cpu().numpy()   # Mgas channel
         # FM-native normed-log -> physical (expm1) -> NF norm3d-gas re-norm (the exact
         # deploy path; FM and NF share norm3d gas stats so this is ~identity but we do
         # it honestly in case the two stats ever diverge).

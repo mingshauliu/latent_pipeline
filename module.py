@@ -168,6 +168,10 @@ class FlowMatchingModel(pl.LightningModule):
         self.ema_enabled = bool(ema_cfg.get("enabled", False))
         self.ema_decay = float(ema_cfg.get("decay", 0.9999))
         self.ema_warmup_steps = int(ema_cfg.get("warmup_steps", 0))
+        # include_encoder=False keeps the gas_encoder LIVE (no EMA shadow/swap/bake):
+        # encoder3D parity — a lagging EMA encoder feeds stale latents to eval/t-SNE
+        # and smooths away early latent spread. Default True = old behavior.
+        self.ema_include_encoder = bool(ema_cfg.get("include_encoder", True))
         self._ema_shadow = None
         self._ema_backup = None
 
@@ -224,11 +228,14 @@ class FlowMatchingModel(pl.LightningModule):
         return self.vel_aux_weight * min(1.0, self.current_epoch / self.vel_aux_warmup_epochs)
 
     # latent + UNet params get EMA, keyed to match checkpoint state_dict.
+    # ema.include_encoder=False drops gas_encoder.* -> shadow/swap/bake are all
+    # derived from this iterator, so the encoder stays live everywhere.
     def _fm_named_params(self):
         for n, p in self.net.named_parameters():
             yield f"net.{n}", p
-        for n, p in self.gas_encoder.named_parameters():
-            yield f"gas_encoder.{n}", p
+        if self.ema_include_encoder:
+            for n, p in self.gas_encoder.named_parameters():
+                yield f"gas_encoder.{n}", p
 
     def forward(self, x, t, cosmo, latent):
         return self.net(x, t, cosmo, latent)
@@ -359,7 +366,8 @@ class FlowMatchingModel(pl.LightningModule):
     def _collect_tsne(self, batch):
         _, mgas, extras, _, _ = self._unpack(batch)
         enc_in = mgas.float() if not extras else torch.cat([mgas.float(), *[e.float() for e in extras]], dim=1)
-        z, _ = self._encode_latent(enc_in, sample_latent=False)   # (B, latent_dim), EMA wts
+        z, _ = self._encode_latent(enc_in, sample_latent=False)   # (B, latent_dim); EMA wts
+        # only if ema.include_encoder (else the live encoder — what actually trains)
         self._tsne_lat.append(z.detach().float().cpu().numpy())
 
     def on_validation_epoch_start(self):
